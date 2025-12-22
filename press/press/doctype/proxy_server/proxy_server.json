@@ -72,7 +72,6 @@
  ],
  "fields": [
   {
-   "fetch_from": "virtual_machine.public_ip_address",
    "fieldname": "ip",
    "fieldtype": "Data",
    "in_list_view": 1,
@@ -166,7 +165,11 @@
    "fieldname": "provider",
    "fieldtype": "Select",
    "label": "Provider",
+<<<<<<< HEAD
    "options": "Generic\nScaleway\nAWS EC2\nOCI\nHetzner",
+=======
+   "options": "Generic\nScaleway\nAWS EC2\nOCI\nHetzner\nVodacom\nFrappe Compute",
+>>>>>>> 971e86b31 (feat: frappe compute client (WIP))
    "set_only_once": 1
   },
   {
