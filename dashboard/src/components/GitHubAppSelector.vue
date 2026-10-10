@@ -2,22 +2,30 @@
 	<div v-if="$resources.options.loading" class="mt-2 flex justify-center">
 		<LoadingText />
 	</div>
-	<div class="flex justify-center pt-2" v-else-if="!options?.authorized">
-		<Button
-			v-if="requiresReAuth"
-			variant="solid"
-			icon-left="github"
-			label="Re-authorize GitHub"
-			@click="$resources.clearAccessToken.submit()"
-			:loading="$resources.clearAccessToken.loading"
-		/>
-		<Button
-			v-if="needsAuthorization"
-			variant="solid"
-			icon-left="github"
-			label="Connect To GitHub"
-			:link="options.installation_url + '?state=' + state"
-		/>
+	<div class="pt-2" v-else-if="!options?.authorized">
+		<div v-if="!!needsAuthorization" class="flex justify-center">
+			<Button
+				variant="solid"
+				icon-left="github"
+				label="Connect To GitHub"
+				:link="installationLink"
+			/>
+		</div>
+		<div v-else-if="!!requiresReAuth" class="flex justify-center">
+			<Button
+				variant="solid"
+				icon-left="github"
+				label="Re-authorize GitHub"
+				@click="$resources.clearAccessToken.submit()"
+				:loading="$resources.clearAccessToken.loading"
+			/>
+		</div>
+		<div
+			v-else-if="$resources.options.error?.messages?.[0]"
+			class="flex flex-row justify-center"
+		>
+			<ErrorMessage :message="$resources.options.error?.messages?.[0]" />
+		</div>
 	</div>
 	<div v-else class="space-y-4">
 		<FormControl
@@ -56,12 +64,9 @@
 				<FeatherIcon v-else name="user" class="mr-2 h-4 w-4" />
 			</template>
 		</FormControl>
-		<span class="text-sm text-gray-600">
+		<span class="text-sm text-ink-gray-6">
 			Don't see your organization?
-			<Link
-				:href="options.installation_url + '?state=' + state"
-				class="font-medium"
-			>
+			<Link :href="installationLink" class="font-medium">
 				Add from GitHub
 			</Link>
 		</span>
@@ -95,67 +100,69 @@
 			</template>
 		</FormControl>
 
-		<p v-if="selectedGithubUserData" class="!mt-2 text-sm text-gray-600">
+		<p v-if="selectedGithubUserData" class="!mt-2 text-sm text-ink-gray-6">
 			Don't see your repository here?
 			<Link :href="selectedGithubUserData.url" class="font-medium">
 				Add from GitHub
 			</Link>
 		</p>
-		<FormControl
-			v-if="selectedGithubRepository"
-			type="combobox"
-			label="Choose Branch"
-			:options="branchOptions"
-			:modelValue="selectedBranch?.value"
-			@update:modelValue="
-				(optionValue) => {
-					selectedBranch = branchOptions.find(
-						(option) => option.value === optionValue,
-					);
-				}
-			"
-		>
-			<template #prefix>
-				<FeatherIcon name="git-branch" class="mr-2 h-4 w-4" />
-			</template>
-		</FormControl>
+
+		<div v-if="selectedGithubRepository" class="space-y-1.5">
+			<div class="text-xs text-ink-gray-5">Choose Branch</div>
+			<Combobox
+				v-if="selectedGithubRepository"
+				allow-custom-value
+				:options="branchOptions"
+				:modelValue="selectedBranch?.value"
+				@update:modelValue="onChangeBranchDebounce"
+			>
+				<template #prefix>
+					<FeatherIcon name="git-branch" class="mr-2 h-4 w-4" />
+				</template>
+			</Combobox>
+		</div>
 	</div>
 </template>
 
 <script>
+import { Combobox, debounce } from 'frappe-ui'
+
 export default {
+	components: {
+		Combobox,
+	},
 	emits: ['validateApp', 'fieldChange'],
 	data() {
 		return {
 			app: {},
-			selectedBranch: '',
+			selectedBranch: null,
 			selectedGithubUser: null,
 			selectedGithubRepository: null,
-		};
+		}
 	},
 	watch: {
 		selectedGithubUser() {
-			this.selectedBranch = '';
-			this.$emit('fieldChange');
+			this.selectedBranch = ''
+			this.$emit('fieldChange')
 		},
 		selectedGithubRepository(repo) {
 			if (!repo) {
-				this.selectedBranch = '';
-				return;
+				this.selectedBranch = ''
+				return
 			}
-			this.$emit('fieldChange');
+			this.$emit('fieldChange')
 			this.$resources.branches.submit({
 				owner: this.selectedGithubUser?.login,
 				name: repo?.name,
 				installation: this.selectedGithubUser?.id,
-			});
+			})
 
 			if (this.selectedGithubUserData) {
 				let defaultBranch = this.selectedGithubUserData.repos.find(
 					(r) => r.name === repo.name,
-				).default_branch;
-				this.selectedBranch = { label: defaultBranch, value: defaultBranch };
-			} else this.selectedBranch = '';
+				).default_branch
+				this.selectedBranch = { label: defaultBranch, value: defaultBranch }
+			} else this.selectedBranch = ''
 		},
 		selectedBranch(newSelectedBranch) {
 			if (this.appOwner && this.appName && newSelectedBranch)
@@ -164,70 +171,92 @@ export default {
 					repository: this.appName,
 					branch: newSelectedBranch.value,
 					selectedGithubUser: this.selectedGithubUserData,
-				});
+				})
 		},
 	},
 	resources: {
 		options() {
 			return {
 				url: 'press.api.github.options',
+				makeParams() {
+					return {
+						redirect_url: window.location.href,
+					}
+				},
 				auto: true,
-			};
+			}
 		},
 		branches() {
 			return {
 				url: 'press.api.github.branches',
-			};
+			}
 		},
 		clearAccessToken() {
 			return {
 				url: 'press.api.github.clear_token_and_get_installation_url',
-				onSuccess(installation_url) {
-					window.location.href = installation_url + '?state=' + this.state;
+				makeParams() {
+					return {
+						redirect_url: window.location.href,
+					}
 				},
-			};
+				onSuccess(installationData) {
+					window.location.href = this.getInstallationLink(installationData)
+				},
+			}
+		},
+	},
+	methods: {
+		getInstallationLink(installationData) {
+			if (!installationData?.installation_url || !installationData?.state) {
+				return null
+			}
+
+			return `${installationData.installation_url}?state=${installationData.state}`
 		},
 	},
 	computed: {
 		options() {
-			return this.$resources.options.data;
+			return this.$resources.options.data
+		},
+		installationLink() {
+			return this.getInstallationLink(this.options)
 		},
 		appOwner() {
-			return this.selectedGithubUser?.login;
+			return this.selectedGithubUser?.login
 		},
 		appName() {
-			return this.selectedGithubRepository?.name;
+			return this.selectedGithubRepository?.name
 		},
 		branchOptions() {
 			return (this.$resources.branches.data || []).map((branch) => ({
 				label: branch.name,
 				value: branch.name,
-			}));
+			}))
 		},
 		selectedGithubUserData() {
-			if (!this.selectedGithubUser) return null;
+			if (!this.selectedGithubUser) return null
 			return this.options.installations.find(
 				(i) => i.id === Number(this.selectedGithubUser.id),
-			);
+			)
 		},
 		needsAuthorization() {
-			if (this.$resources.options.loading) return false;
+			if (this.$resources.options.loading) return false
 			return (
 				this.$resources.options.data &&
 				(!this.$resources.options.data.authorized ||
 					this.$resources.options.data.installations.length === 0)
-			);
+			)
 		},
 		requiresReAuth() {
-			return this.$resources.options?.error?.messages.includes(
-				'Bad credentials',
-			);
-		},
-		state() {
-			let location = window.location.href;
-			let state = { team: this.$team.name, url: location };
-			return btoa(JSON.stringify(state));
+			return this.$resources.options?.error?.messages?.some(
+				(msg) => msg.includes && msg.includes('Bad credentials'),
+			)
 		},
 	},
-};
+	created() {
+		this.onChangeBranchDebounce = debounce((val) => {
+			this.selectedBranch = { label: val, value: val }
+		}, 500)
+	},
+}
 </script>

@@ -33,7 +33,7 @@
 
 					<div
 						v-if="!searchQuery.length"
-						class="text-xs font-medium text-gray-500 py-2 pl-2"
+						class="text-xs font-medium text-ink-gray-5 py-2 pl-2"
 					>
 						Recent
 					</div>
@@ -44,9 +44,12 @@
 					<div
 						v-for="option in displayedOptions"
 						:key="option.value"
-						@click="selectOption(option, togglePopover)"
-						class="flex cursor-pointer items-center justify-between rounded px-2.5 py-1.5 text-base hover:bg-gray-50"
-						:class="{ 'bg-surface-gray-3': isSelected(option) }"
+						@click="!option.is_yanked && selectOption(option, togglePopover)"
+						class="flex cursor-pointer items-center justify-between rounded px-2.5 py-1.5 text-base hover:bg-surface-gray-1"
+						:class="{
+							'bg-surface-gray-3': isSelected(option),
+							'opacity-50 cursor-not-allowed': option.is_yanked,
+						}"
 					>
 						<div class="flex flex-1 gap-2 overflow-hidden items-center">
 							<div class="flex flex-shrink-0">
@@ -72,9 +75,21 @@
 							>
 								{{ option.label }}
 							</span>
+							<span
+								v-if="option.is_mandatory"
+								class="text-xs text-blue-500 font-medium"
+							>
+								Mandatory
+							</span>
+							<span
+								v-if="option.is_yanked"
+								class="text-xs text-red-500 font-medium"
+							>
+								Yanked
+							</span>
 						</div>
 					</div>
-					<div class="*:text-center *:mb-2 *:mt-3 *:text-xs *:text-gray-400">
+					<div class="*:text-center *:mb-2 *:mt-3 *:text-xs *:text-ink-gray-4">
 						<div v-if="$resources.releases.loading && !!searchQuery.length">
 							Searching...
 						</div>
@@ -87,8 +102,7 @@
 </template>
 
 <script>
-import { Popover, Button, debounce } from 'frappe-ui';
-import FormControl from 'frappe-ui/src/components/FormControl/FormControl.vue';
+import { Popover, Button, debounce, FormControl } from 'frappe-ui';
 import { nextTick } from 'vue';
 
 export default {
@@ -103,7 +117,14 @@ export default {
 			queryResult: [],
 		};
 	},
-	props: ['options', 'modelValue', 'app', 'source'],
+	props: [
+		'options',
+		'modelValue',
+		'app',
+		'source',
+		'currentRelease',
+		'is_yanked',
+	],
 	emits: ['update:modelValue'],
 	methods: {
 		selectOption(option, togglePopover) {
@@ -145,6 +166,7 @@ export default {
 					source: this.source,
 					query: this.searchQuery?.trim(),
 					fields: ['name', 'message', 'timestamp', 'hash'],
+					current_release: this.currentRelease,
 					limit: 20,
 				},
 				initialData: [],

@@ -29,6 +29,7 @@ class AnalyticsServer(BaseServer):
 		hostname: DF.Data
 		ip: DF.Data
 		is_server_setup: DF.Check
+		is_wazuh_agent_installed: DF.Check
 		monitoring_password: DF.Password | None
 		plausible_mail_login: DF.Data | None
 		plausible_mail_password: DF.Password | None
@@ -43,6 +44,8 @@ class AnalyticsServer(BaseServer):
 		status: DF.Literal["Pending", "Installing", "Active", "Broken", "Archived"]
 		tls_certificate_renewal_failed: DF.Check
 		virtual_machine: DF.Link | None
+		wazuh_agent_status: DF.Data | None
+		wazuh_install_last_attempt: DF.Datetime | None
 	# end: auto-generated types
 
 	def validate(self):
@@ -93,7 +96,7 @@ class AnalyticsServer(BaseServer):
 					"google_client_secret": self.get_password("google_client_secret"),
 					"monitoring_password": self.get_password("monitoring_password"),
 					"private_ip": self.private_ip,
-					"certificate_private_key": certificate.private_key,
+					"certificate_private_key": certificate.get_private_key(),
 					"certificate_full_chain": certificate.full_chain,
 					"certificate_intermediate_chain": certificate.intermediate_chain,
 				},

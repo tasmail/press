@@ -15,7 +15,7 @@ from press.utils.telemetry import capture
 
 
 @frappe.whitelist(allow_guest=True)
-def login(product=None):
+def login(product: str | None = None):
 	flow = google_oauth_flow()
 	authorization_url, state = flow.authorization_url()
 	minutes = 5
@@ -27,7 +27,7 @@ def login(product=None):
 
 
 @frappe.whitelist(allow_guest=True)
-def callback(code=None, state=None):  # noqa: C901
+def callback(code: str | None = None, state: str | None = None):  # noqa: C901
 	cached_key = f"google_oauth_flow:{state}"
 	payload = frappe.cache().get_value(cached_key)
 	if not payload:
@@ -70,7 +70,7 @@ def callback(code=None, state=None):  # noqa: C901
 
 	team_name, team_enabled = frappe.db.get_value("Team", {"user": email}, ["name", "enabled"]) or [0, 0]
 
-	if team_name and not team_enabled:
+	if team_name and not team_enabled and product_trial:
 		frappe.throw(_("Account {0} has been deactivated").format(email))
 		return None
 
@@ -92,7 +92,12 @@ def callback(code=None, state=None):  # noqa: C901
 		# login to existing account
 		frappe.local.login_manager.login_as(email)
 		frappe.local.response.type = "redirect"
-		frappe.local.response.location = "/dashboard"
+		if not team_enabled:
+			# route lookup fails for a disabled team, the dashboard asks them to reactivate
+			frappe.local.response.location = "/dashboard"
+		else:
+			team = frappe.get_doc("Team", team_name)
+			frappe.local.response.location = f"/dashboard{team.get_route_on_login()}"
 		return None
 
 	# create account request
@@ -101,7 +106,7 @@ def callback(code=None, state=None):  # noqa: C901
 		email=email,
 		first_name=id_info.get("given_name"),
 		last_name=id_info.get("family_name"),
-		role="Press Admin",
+		role="Press User",
 		oauth_signup=True,
 		product_trial=product_trial.name if product_trial else None,
 	)
@@ -152,5 +157,7 @@ def get_google_credentials():
 
 	config = frappe.conf.get("google_credentials")
 	if not config:
-		frappe.throw("google_credentials not found in site_config.json")
+		frappe.throw(
+			"Google credentials are not configured. Please add 'google_credentials' to site_config.json before using this feature, or contact your administrator."
+		)
 	return config

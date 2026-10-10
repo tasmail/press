@@ -38,6 +38,17 @@ if TYPE_CHECKING:
 	)
 	from press.press.doctype.site.site import Site
 
+# Site Usage stores sizes in MB
+LARGE_DATABASE_SIZE_MB = 100 * 1024
+# Above this a recovery migrate risks the statement timeout, so the bump is worthwhile.
+# Well below LARGE_DATABASE_SIZE_MB above, which gates a different thing — read both.
+STATEMENT_TIME_BUMP_SIZE_MB = 2 * 1024
+
+# Where an update stops being harmless: after this the site is on the destination bench,
+# and the migration runs there. Everything before it, the backup included, leaves the site
+# untouched — if the backup fails, the job stops and never gets here.
+POINT_OF_NO_RETURN_STEP = "Move Site"
+
 
 class SiteUpdate(Document):
 	# begin: auto-generated types
@@ -62,6 +73,7 @@ class SiteUpdate(Document):
 		group: DF.Link | None
 		logical_replication_backup: DF.Link | None
 		physical_backup_restoration: DF.Link | None
+		previous_max_statement_time: DF.Int
 		recover_job: DF.Link | None
 		scheduled_time: DF.Datetime | None
 		server: DF.Link | None
@@ -126,9 +138,6 @@ class SiteUpdate(Document):
 		return doc
 
 	def validate(self):
-		if not self.is_new():
-			return
-
 		# Assume same-group migration if destination_group isn't set
 		if not self.destination_group:
 			self.destination_group = self.group
@@ -152,8 +161,7 @@ class SiteUpdate(Document):
 		self.validate_apps()
 		self.validate_pending_updates()
 		self.validate_past_failed_updates()
-		self.set_physical_backup_mode_if_eligible()
-		self.set_logical_replication_backup_mode_if_eligible()
+		self.set_backup_type()
 
 	def validate_destination_bench(self, differences):
 		if not self.destination_bench:
@@ -211,6 +219,22 @@ class SiteUpdate(Document):
 	def use_logical_replication_backup(self):
 		return self.backup_type == "Logical Replication" and not self.skipped_backups
 
+	def should_mark_site_fatal(self) -> bool:
+		"""An update that failed before it moved the site left nothing for an operator to resolve.
+
+		A step gets a start time only when the agent runs it. Stale job cleanup overwrites the
+		status of steps that never ran, so the start time is the only reliable signal. A missing
+		step gets the site blocked. A move that started but failed also gets the site blocked:
+		the agent doesn't say how far it got, so we assume the worst.
+		"""
+		move_site = frappe.db.get_value(
+			"Agent Job Step",
+			{"agent_job": self.update_job, "step_name": POINT_OF_NO_RETURN_STEP},
+			"start",
+			as_dict=True,
+		)
+		return not move_site or bool(move_site.start)
+
 	def validate_past_failed_updates(self):
 		if getattr(self, "ignore_past_failures", False):
 			return
@@ -231,45 +255,80 @@ class SiteUpdate(Document):
 
 		if diff := set(site_apps) - set(bench_apps):
 			frappe.throw(
-				f"Destination Bench {self.destination_bench} doesn't have some of the apps installed on {self.site}: {', '.join(diff)}",
+				f"Destination Bench <b>{self.destination_bench}</b> doesn't have some of the apps installed on the site: {', '.join(diff)}. Please uninstall them from the site or add them back to the bench (and update the same) before proceeding.",
 				frappe.ValidationError,
 			)
 
 	def before_insert(self):
 		self.backup_type = "Logical"
-		site: "Site" = frappe.get_cached_doc("Site", self.site)
+		site: "Site" = frappe.get_doc("Site", self.site)
 		site.check_move_scheduled()
+		site.check_fatal_site_update()
 
 	def after_insert(self):
 		if not self.scheduled_time:
 			self.start()
 
-	def set_physical_backup_mode_if_eligible(self):  # noqa: C901
-		if self.skipped_backups:
+	@property
+	def database_size(self) -> int:
+		"""Database size in MB, as last reported by the site's server."""
+		return frappe.get_doc("Site", self.site).database_size
+
+	@property
+	def database_server_provider(self) -> str | None:
+		database_server = frappe.get_value("Server", self.server, "database_server")
+		return database_server and frappe.get_value("Database Server", database_server, "provider")
+
+	def set_backup_type(self):
+		"""Only a Migrate update on an AWS database server takes a backup worth a choice.
+
+		A Pull update just moves the site to the new bench, and the agent takes no backup
+		for it. Physical and Logical Replication backups need AWS EBS snapshots.
+		"""
+		if self.skipped_backups or self.deploy_type != "Migrate":
 			return
 
-		if self.deploy_type != "Migrate":
+		# A standby site skips its backup at start, so it needs no snapshot.
+		if frappe.db.get_value("Site", self.site, "is_standby"):
 			return
 
+		# No provider also means no database server, as with a configured RDS server.
+		if self.database_server_provider != "AWS EC2":
+			return
+
+		self.set_physical_backup_mode_if_eligible()
+		self.set_logical_replication_backup_mode_if_eligible()
+		self.validate_backup_type_for_large_database()
+
+	def validate_backup_type_for_large_database(self):
+		"""A logical backup of a huge database takes too long and often fails mid-update.
+
+		Physical and Logical Replication backups don't take a full dump, so they're fine.
+		"""
+		if self.backup_type in ("Physical", "Logical Replication"):
+			return
+
+		if self.database_size <= LARGE_DATABASE_SIZE_MB:
+			return
+
+		frappe.throw(
+			f"Database of site {self.site} is too large to update without a physical backup. "
+			"Please <a href='/support'>contact support</a> to get this update done.",
+			frappe.ValidationError,
+		)
+
+	def set_physical_backup_mode_if_eligible(self):
 		# Check if physical backup is disabled globally from Press Settings
 		if frappe.utils.cint(frappe.get_value("Press Settings", None, "disable_physical_backup")):
 			return
 
 		database_server = frappe.get_value("Server", self.server, "database_server")
-		if not database_server:
-			# It might be the case of configured RDS server and no self hosted database server
-			return
 
 		# Check if physical backup is enabled on the database server
 		enable_physical_backup = frappe.get_value(
 			"Database Server", database_server, "enable_physical_backup"
 		)
 		if not enable_physical_backup:
-			return
-
-		# Sanity check - Provider should be AWS EC2
-		provider = frappe.get_value("Database Server", database_server, "provider")
-		if provider != "AWS EC2":
 			return
 
 		# In case of ebs encryption don't proceed with physical backup
@@ -297,22 +356,6 @@ class SiteUpdate(Document):
 			self.backup_type = "Physical"
 
 	def set_logical_replication_backup_mode_if_eligible(self):
-		if self.skipped_backups:
-			return
-
-		if self.deploy_type != "Migrate":
-			return
-
-		database_server = frappe.get_value("Server", self.server, "database_server")
-		if not database_server:
-			# It might be the case of configured RDS server and no self hosted database server
-			return
-
-		# Sanity check - Provider should be AWS EC2
-		provider = frappe.get_value("Database Server", database_server, "provider")
-		if provider != "AWS EC2":
-			return
-
 		if not frappe.get_value("Server", self.server, "enable_logical_replication_during_site_update"):
 			return
 
@@ -350,12 +393,41 @@ class SiteUpdate(Document):
 
 			return
 
+		self.skip_backups_for_standby_site()
 		if self.use_physical_backup:
 			self.deactivate_site()
 		elif self.use_logical_replication_backup:
 			self.create_logical_replication_backup_record()
 		else:
 			self.create_update_site_agent_request()
+
+	def skip_backups_for_standby_site(self):
+		"""Skip the backup of a site still in the standby pool once its move has started."""
+		# Checked at start, not insert, since a site can leave the pool in between.
+		if not self.skipped_backups and frappe.db.get_value("Site", self.site, "is_standby"):
+			self.skipped_backups = True
+			self.save()
+
+	def fail_with_notification(self, reason: str):
+		frappe.db.set_value("Site Update", self.name, "status", "Cancelled")
+		site = frappe.get_cached_doc("Site", self.site)
+		message = f"Site Update was cancelled: {reason}"
+		self.create_notification(site.team, message)
+
+	def create_notification(self, team: str, message: str):
+		frappe.get_doc(
+			{
+				"doctype": "Press Notification",
+				"team": team,
+				"type": "Site Update",
+				"document_type": "Site Update",
+				"document_name": self.name,
+				"reference_doctype": "Site",
+				"reference_name": self.site,
+				"message": message,
+			}
+		).insert(ignore_permissions=True)
+		frappe.publish_realtime("press_notification", doctype="Press Notification", message={"team": team})
 
 	def get_before_migrate_scripts(self, rollback=False):
 		site_apps = [app.app for app in frappe.get_doc("Site", self.site).apps]
@@ -463,6 +535,7 @@ class SiteUpdate(Document):
 			"Site Update",
 			{
 				"site": self.site,
+				"name": ("!=", self.name),
 				"source_candidate": self.source_candidate,
 				"destination_candidate": self.destination_candidate,
 				"cause_of_failure_is_resolved": False,
@@ -474,6 +547,7 @@ class SiteUpdate(Document):
 			"Site Update",
 			{
 				"site": self.site,
+				"name": ("!=", self.name),
 				"status": ("in", ("Pending", "Running", "Failure", "Scheduled", "Recovering")),
 			},
 		)
@@ -520,6 +594,41 @@ class SiteUpdate(Document):
 			return json.loads(self.touched_tables)
 		except Exception:
 			return []
+
+	def bump_max_statement_time_before_recovery(self, site: "Site") -> None:
+		# A migrate recovery's heavy queries can exceed max_statement_time on large sites
+		# and get killed, so bump it by an hour first. Small databases aren't at risk.
+		if self.deploy_type != "Migrate" or site.database_size <= STATEMENT_TIME_BUMP_SIZE_MB:
+			return
+		# This is a best-effort optimization; a failure here (e.g. Ansible can't reach the
+		# database server) must not abort the recovery, which is the whole point of this flow.
+		try:
+			old_timeout, new_timeout = site.increase_max_statement_time()
+		except Exception:
+			log_error("Failed to bump max_statement_time before recovery", site_update=self.name)
+			return
+		if not old_timeout:
+			# The server had no limit, so nothing was bumped and nothing needs restoring.
+			return
+		# Stash the old value so restore_max_statement_time can put it back once recovery ends.
+		self.db_set("previous_max_statement_time", old_timeout)
+		self.add_comment(
+			text=(
+				f"Increased <code>max_statement_time</code> on the database server from "
+				f"{old_timeout}s to {new_timeout}s before the recovery migrate job."
+			)
+		)
+
+	def restore_max_statement_time(self) -> None:
+		# No-op unless a recovery migrate bumped it (see bump_max_statement_time_before_recovery).
+		if not self.previous_max_statement_time:
+			return
+		# In the background: this runs from agent job callbacks, and an inline Ansible play
+		# commits mid-callback and can raise into it. Nothing waits on the new value.
+		frappe.get_doc("Site", self.site).set_max_statement_time(
+			self.previous_max_statement_time, synchronously=False
+		)
+		self.db_set("previous_max_statement_time", 0)
 
 	@frappe.whitelist()
 	def trigger_recovery_job(self):  # noqa: C901
@@ -576,12 +685,17 @@ class SiteUpdate(Document):
 					update_status(self.name, "Fatal")
 					# mark site as broken
 					frappe.db.set_value("Site", self.site, "status", "Broken")
+					frappe.db.set_value("Site", self.site, "fatal_site_update", self.name)
 					return
 				if physical_backup_restoration_status != "Success":
 					# just to be safe
-					frappe.throw("Physical Backup Restoration is still in progress")
+					frappe.throw(
+						"The physical backup restoration is still in progress. Please wait for it to finish before retrying the site update."
+					)
 
 			# Attempt to move site to source bench
+
+			self.bump_max_statement_time_before_recovery(site)
 
 			# Disable maintenance mode for active sites
 			activate = site.status_before_update == "Active"
@@ -696,6 +810,18 @@ class SiteUpdate(Document):
 
 		if self.activate_site_job:
 			steps.extend(self.get_job_steps(self.activate_site_job, "Activate Site"))
+
+		# If there is no steps, add a dummy step to show that the update is scheduled but yet to start
+		if not steps:
+			steps = [
+				{
+					"name": "site_update_scheduled",
+					"title": f"Scheduled at {convert_utc_to_system_timezone(self.scheduled_time).strftime('%Y-%m-%d %H:%M:%S') if self.scheduled_time and self.status == 'Scheduled' else ''}",
+					"status": "Pending",
+					"output": "",
+					"stage": "Site Update",
+				}
+			]
 		return steps
 
 	def get_job_steps(self, job: str, stage: str):
@@ -719,6 +845,9 @@ class SiteUpdate(Document):
 	@frappe.whitelist()
 	def set_cause_of_failure_is_resolved(self):
 		frappe.db.set_value("Site Update", self.name, "cause_of_failure_is_resolved", 1)
+		site: Site = frappe.get_doc("Site", self.site)
+		if site.fatal_site_update == self.name:
+			frappe.db.set_value("Site", self.site, "fatal_site_update", None)
 
 	@frappe.whitelist()
 	def set_status(self, status):
@@ -829,8 +958,9 @@ def sites_with_available_update(server=None):
 			"bench": ("in", benches),
 			"only_update_at_specified_time": False,  # will be taken care of by another scheduled job
 			"skip_auto_updates": False,
+			"fatal_site_update": ("is", "not set"),
 		},
-		fields=["name", "timezone", "bench", "server", "status"],
+		fields=["name", "timezone", "bench", "server", "status", "is_standby"],
 	)
 
 
@@ -847,9 +977,24 @@ def schedule_updates():
 
 
 def schedule_updates_server(server):
-	# Prevent flooding the queue
 	queue_size = frappe.db.get_single_value("Press Settings", "auto_update_queue_size")
-	pending_update_count = frappe.db.count(
+	if count_pending_updates(server) > queue_size:
+		return
+
+	sites = sites_with_available_update(server)
+	# One budget per server, as large as before: queue_size + 1 new updates a run.
+	# Standby sites spend it first, customer sites get what is left.
+	limit = queue_size + 1
+	standby_sites = [site for site in sites if site.is_standby]
+	limit -= schedule_site_updates(standby_sites, limit, one_per_bench=False)
+
+	customer_sites = [site for site in sites if not site.is_standby and is_site_in_deploy_hours(site)]
+	schedule_site_updates(customer_sites, limit, one_per_bench=True)
+
+
+def count_pending_updates(server: str) -> int:
+	"""Count the updates on a server that are still waiting or running."""
+	return frappe.db.count(
 		"Site Update",
 		{
 			"status": ("in", ("Pending", "Running")),
@@ -857,12 +1002,10 @@ def schedule_updates_server(server):
 			"creation": (">", frappe.utils.add_to_date(None, hours=-4)),
 		},
 	)
-	if pending_update_count > queue_size:
-		return
 
-	sites = sites_with_available_update(server)
-	sites = list(filter(is_site_in_deploy_hours, sites))
 
+def schedule_site_updates(sites: list, limit: int, one_per_bench: bool) -> int:
+	"""Schedule updates for up to `limit` of the sites and return how many were scheduled."""
 	# If a site can't be updated for some reason, then we shouldn't get stuck
 	# Shuffle sites list, to achieve this
 	random.shuffle(sites)
@@ -870,9 +1013,9 @@ def schedule_updates_server(server):
 	benches = {}
 	update_triggered_count = 0
 	for site in sites:
-		if site.bench in benches:
+		if one_per_bench and site.bench in benches:
 			continue
-		if update_triggered_count > queue_size:
+		if update_triggered_count >= limit:
 			break
 		if not should_try_update(site) or frappe.db.exists(
 			"Site Update",
@@ -895,8 +1038,10 @@ def schedule_updates_server(server):
 			log_error("Site Update Exception", site=site)
 			frappe.db.rollback()
 
+	return update_triggered_count
 
-def should_try_update(site):
+
+def should_try_update(site: Site):
 	source = frappe.db.get_value("Bench", site.bench, "candidate")
 	candidates = frappe.get_all(
 		"Deploy Candidate Difference", filters={"source": source}, pluck="destination"
@@ -926,6 +1071,10 @@ def should_try_update(site):
 	if set(source_apps) - set(dest_apps):
 		return False
 
+	# If site has fatal update which is not resolved, then don't trigger update
+	if site.fatal_site_update:
+		return False
+
 	return not frappe.db.exists(
 		"Site Update",
 		{
@@ -937,8 +1086,10 @@ def should_try_update(site):
 	)
 
 
-def is_site_in_deploy_hours(site):
+def is_site_in_deploy_hours(site: Site):
 	if site.status in ("Inactive", "Suspended"):
+		return True
+	if site.is_standby:
 		return True
 	server_time = datetime.now()
 	timezone = site.timezone or "Asia/Kolkata"
@@ -1037,6 +1188,12 @@ def handle_success(job: AgentJob, site_update: OngoingUpdate):
 	else:
 		frappe.get_doc("Site", job.site).reset_previous_status(fix_broken=True)
 
+	if job.site:
+		try:
+			frappe.get_doc("Site", job.site).sync_apps()
+		except Exception:
+			log_error("Site App Sync Failed After Site Update", job=job.as_dict())
+
 
 def handle_fatal(job: AgentJob, site_update: OngoingUpdate):
 	if site_update.backup_type in ["Physical", "Logical Replication"]:
@@ -1113,11 +1270,8 @@ def process_update_site_recover_job_update(job: AgentJob):
 		"Failure": "Fatal",
 		"Delivery Failure": "Fatal",
 	}[job.status]
-	site_update = frappe.get_all(
-		"Site Update",
-		fields=["name", "status", "source_bench", "group"],
-		filters={"recover_job": job.name},
-	)[0]
+	site_update_name = frappe.db.get_value("Site Update", {"recover_job": job.name}, "name")
+	site_update = frappe.get_doc("Site Update", site_update_name)
 	if updated_status != site_update.status:
 		site_bench = frappe.db.get_value("Site", job.site, "bench")
 		move_site_step_status = frappe.db.get_value(
@@ -1133,8 +1287,12 @@ def process_update_site_recover_job_update(job: AgentJob):
 			frappe.db.set_value("Site", job.site, "status", "Recovering")
 		elif updated_status == "Recovered":
 			frappe.get_doc("Site", job.site).reset_previous_status()
+			site_update.restore_max_statement_time()
 		elif updated_status == "Fatal":
 			frappe.db.set_value("Site", job.site, "status", "Broken")
+			if site_update.should_mark_site_fatal():
+				frappe.db.set_value("Site", job.site, "fatal_site_update", site_update.name)
+			site_update.restore_max_statement_time()
 
 
 def mark_stuck_updates_as_fatal():
@@ -1165,6 +1323,9 @@ def run_scheduled_updates():
 			site_update.validate()
 			site_update.start()
 			frappe.db.commit()
+		except frappe.ValidationError as e:
+			site_update.fail_with_notification(str(e))
+			frappe.db.commit()
 		except Exception:
 			log_error("Scheduled Site Update Error", update=update)
 			frappe.db.rollback()
@@ -1173,6 +1334,7 @@ def run_scheduled_updates():
 def on_doctype_update():
 	frappe.db.add_index("Site Update", ["site", "source_candidate", "destination_candidate"])
 	frappe.db.add_index("Site Update", ["server", "status"])
+	frappe.db.add_index("Site Update", ["destination_candidate", "status"])
 
 
 def process_callback_from_logical_replication_backup(backup: "LogicalReplicationBackup"):  # noqa: C901

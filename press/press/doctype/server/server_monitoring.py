@@ -1,0 +1,802 @@
+# Copyright (c) 2019, Frappe and contributors
+# For license information, please see license.txt
+
+from __future__ import annotations
+
+import re
+from collections import Counter
+from contextlib import suppress
+from typing import TypedDict
+
+import frappe
+import requests
+from frappe.utils.password import get_decrypted_password
+
+from press.utils import log_error
+from press.utils.raven import send_raven_message
+
+RAVEN_SERVER_ALERTS_CHANNEL = "frappe-cloud-server-alerts"
+PROMETHEUS_REGEX_META_CHAR_PATTERN = re.compile(r"([\\.^$*+?()[\]{}|])")
+
+# No dedicated signup channel yet, so signup alerts land with the other alerts
+RAVEN_SIGNUP_ALERTS_CHANNEL = RAVEN_SERVER_ALERTS_CHANNEL
+SIGNUP_ALERT_WINDOW_HOURS = 1
+# Time a signup gets to read the mail and finish before it counts as incomplete
+SIGNUP_COMPLETION_GRACE_HOURS = 1
+TEST_SIGNUP_EMAIL_PATTERN = "fc-signup-test%"
+TRIAL_SIGNUP_FAILURE_RATIO_THRESHOLD = 0.3
+TRIAL_SIGNUP_MINIMUM_COUNT = 5
+# Most people who ask for a verification mail never finish, so only a near-total
+# stall means signups are broken rather than merely abandoned
+INCOMPLETE_SIGNUP_RATIO_THRESHOLD = 0.9
+INCOMPLETE_SIGNUP_MINIMUM_COUNT = 10
+BACKUP_DIGEST_SITE_LIMIT = 50
+
+
+class PublicServerHealthMetrics(TypedDict):
+	available_memory_bytes: dict[str, float]
+	available_memory_ratio: dict[str, float]
+	cpu_idle_ratio: dict[str, float]
+	disk_used_ratio: dict[str, float]
+	oom_kills: dict[str, float]
+
+
+class PublicServerPoolDecision(TypedDict):
+	selected_bench_servers: set[str]
+	selected_site_servers: set[str]
+	servers_with_decision: set[str]
+	server_issues: dict[str, list[str]]
+	fallback_servers_by_cluster: dict[str, str]
+
+
+class SignupFailureRate(TypedDict):
+	label: str
+	failed: int
+	total: int
+	ratio_threshold: float
+	minimum_count: int
+	breakdown: dict[str, int]
+	link: str
+
+
+def monitor_server_and_refresh_new_bench_and_site_server_pool() -> None:
+	"""Refresh `use_for_new_benches` and `use_for_new_sites` flags for public clusters
+	1. Consider active, public primary servers for each cluster
+	2. Fetch memory, CPU and OOM-kill health for all servers in bulk from Prometheus
+	3. Prefer healthy servers on the lowest-priced plan
+	4. Fall back to the least-bad server when a cluster has no healthy candidates
+	"""
+	server_names, servers_by_cluster = _get_public_primary_servers_by_cluster()
+	if not server_names:
+		return
+
+	metrics = _get_public_server_health_metrics(server_names)
+	if not metrics:
+		return
+
+	server_plan_prices = _get_public_server_plan_prices(server_names)
+	pool_decision = _get_public_server_pool_decision(servers_by_cluster, metrics, server_plan_prices)
+	_apply_public_server_pool_decision(server_names, pool_decision)
+	_send_public_server_pool_health_alert(pool_decision["server_issues"])
+	_create_no_suitable_servers_incident(pool_decision["fallback_servers_by_cluster"], metrics)
+
+
+def _get_public_primary_servers_by_cluster() -> tuple[list[str], dict[str, list[str]]]:
+	servers = frappe.get_all(
+		"Server",
+		filters={"status": "Active", "is_primary": True, "public": True, "exclude_for_scheduling": False},
+		fields=["name", "cluster"],
+	)
+	server_names = [server.name for server in servers]
+	servers_by_cluster: dict[str, list[str]] = {}
+	for server in servers:
+		servers_by_cluster.setdefault(server.cluster, []).append(server.name)
+	return server_names, servers_by_cluster
+
+
+def _get_public_server_plan_prices(server_names: list[str]) -> dict[str, float]:
+	servers = frappe.get_all(
+		"Server",
+		filters={"name": ["in", server_names]},
+		fields=["name", "plan"],
+	)
+	plan_names = list({server.plan for server in servers if server.plan})
+	if not plan_names:
+		return {}
+
+	plans = frappe.get_all(
+		"Server Plan",
+		filters={"name": ["in", plan_names]},
+		fields=["name", "price_usd"],
+	)
+	prices_by_plan = {plan.name: float(plan.price_usd) for plan in plans if plan.price_usd is not None}
+	return {server.name: prices_by_plan[server.plan] for server in servers if server.plan in prices_by_plan}
+
+
+def _get_public_server_pool_decision(
+	servers_by_cluster: dict[str, list[str]],
+	metrics: PublicServerHealthMetrics,
+	server_plan_prices: dict[str, float] | None = None,
+) -> PublicServerPoolDecision:
+	server_plan_prices = server_plan_prices or {}
+	ram_available_ratio = metrics["available_memory_ratio"]
+	cpu_idle_ratio = metrics["cpu_idle_ratio"]
+
+	decision: PublicServerPoolDecision = {
+		"selected_bench_servers": set(),
+		"selected_site_servers": set(),
+		"servers_with_decision": set(),
+		"server_issues": {},
+		"fallback_servers_by_cluster": {},
+	}
+
+	for cluster, cluster_servers in servers_by_cluster.items():
+		candidates = [
+			server for server in cluster_servers if server in ram_available_ratio and server in cpu_idle_ratio
+		]
+		if not candidates:
+			continue
+
+		healthy_servers = [
+			server
+			for server in candidates
+			if ram_available_ratio[server] >= 0.2 and cpu_idle_ratio[server] >= 0.5
+		]
+		decision["servers_with_decision"].update(cluster_servers)
+
+		if healthy_servers:
+			preferred_servers = _get_lowest_price_servers(healthy_servers, server_plan_prices)
+			decision["selected_bench_servers"].add(
+				max(
+					sorted(preferred_servers),
+					key=lambda server: _get_bench_pool_score(server, metrics),
+				)
+			)
+			decision["selected_site_servers"].add(
+				max(
+					sorted(preferred_servers),
+					key=lambda server: _get_site_pool_score(server, metrics),
+				)
+			)
+			continue
+
+		selected_server = max(
+			sorted(candidates), key=lambda server: _get_least_bad_pool_score(server, metrics)
+		)
+		decision["selected_bench_servers"].add(selected_server)
+		decision["selected_site_servers"].add(selected_server)
+		decision["fallback_servers_by_cluster"][cluster] = selected_server
+
+	alert_servers = {server for servers in servers_by_cluster.values() for server in servers}
+	for server in alert_servers:
+		issues = _get_public_server_alert_issues(server, metrics)
+		if issues:
+			decision["server_issues"][server] = issues
+
+	return decision
+
+
+def _get_lowest_price_servers(servers: list[str], server_plan_prices: dict[str, float]) -> list[str]:
+	priced_servers = [server for server in servers if server in server_plan_prices]
+	if not priced_servers:
+		return servers
+
+	lowest_price = min(server_plan_prices[server] for server in priced_servers)
+	return [server for server in priced_servers if server_plan_prices[server] == lowest_price]
+
+
+def _get_public_server_placement_issues(server: str, metrics: PublicServerHealthMetrics) -> list[str]:
+	issues = []
+	ram_utilization = 1 - metrics["available_memory_ratio"][server]
+	cpu_utilization = 1 - metrics["cpu_idle_ratio"][server]
+
+	if ram_utilization > 0.8:
+		issues.append(f"RAM utilization: {ram_utilization * 100:.2f}%")
+	if cpu_utilization > 0.5:
+		issues.append(f"CPU utilization: {cpu_utilization * 100:.2f}%")
+
+	return issues
+
+
+def _get_public_server_alert_issues(server: str, metrics: PublicServerHealthMetrics) -> list[str]:
+	issues = []
+	ram_available_ratio = metrics["available_memory_ratio"].get(server)
+	cpu_idle_ratio = metrics["cpu_idle_ratio"].get(server)
+	disk_used_ratio = metrics["disk_used_ratio"].get(server, 0.0)
+	oom_kills = metrics["oom_kills"].get(server, 0.0)
+
+	if ram_available_ratio is not None and 1 - ram_available_ratio > 0.9:
+		issues.append(f"RAM utilization: {(1 - ram_available_ratio) * 100:.2f}%")
+	if cpu_idle_ratio is not None and 1 - cpu_idle_ratio > 0.5:
+		issues.append(f"CPU utilization: {(1 - cpu_idle_ratio) * 100:.2f}%")
+	if disk_used_ratio > 0.9:
+		issues.append(f"Disk utilization: {disk_used_ratio * 100:.2f}%")
+	if oom_kills > 4:
+		issues.append(f"OOM kills: {max(1, round(oom_kills))}")
+
+	return issues
+
+
+def _get_bench_pool_score(
+	server: str, metrics: PublicServerHealthMetrics
+) -> tuple[float, float, float, float]:
+	ram_available_ratio = metrics["available_memory_ratio"].get(server, 0.0)
+	cpu_idle_ratio = metrics["cpu_idle_ratio"].get(server, 0.0)
+	return (
+		min(ram_available_ratio, cpu_idle_ratio),
+		ram_available_ratio,
+		cpu_idle_ratio,
+		metrics["available_memory_bytes"].get(server, 0.0),
+	)
+
+
+def _get_site_pool_score(
+	server: str, metrics: PublicServerHealthMetrics
+) -> tuple[float, float, float, float]:
+	ram_available_ratio = metrics["available_memory_ratio"].get(server, 0.0)
+	cpu_idle_ratio = metrics["cpu_idle_ratio"].get(server, 0.0)
+	return (
+		min(cpu_idle_ratio, ram_available_ratio),
+		cpu_idle_ratio,
+		ram_available_ratio,
+		metrics["available_memory_bytes"].get(server, 0.0),
+	)
+
+
+def _get_least_bad_pool_score(
+	server: str, metrics: PublicServerHealthMetrics
+) -> tuple[int, float, float, float]:
+	failed_check_count = len(_get_public_server_placement_issues(server, metrics))
+	return (
+		-failed_check_count,
+		metrics["cpu_idle_ratio"].get(server, 0.0),
+		metrics["available_memory_ratio"].get(server, 0.0),
+		metrics["available_memory_bytes"].get(server, 0.0),
+	)
+
+
+def _apply_public_server_pool_decision(
+	server_names: list[str],
+	decision: PublicServerPoolDecision,
+) -> None:
+	servers_with_decision = decision["servers_with_decision"]
+	if not servers_with_decision:
+		return
+
+	bench_servers_to_disable = list(servers_with_decision - decision["selected_bench_servers"])
+	site_servers_to_disable = list(servers_with_decision - decision["selected_site_servers"])
+	if bench_servers_to_disable:
+		frappe.db.set_value(
+			"Server",
+			{"name": ["in", bench_servers_to_disable]},
+			{"use_for_new_benches": 0},
+			update_modified=False,
+		)
+	if site_servers_to_disable:
+		frappe.db.set_value(
+			"Server",
+			{"name": ["in", site_servers_to_disable]},
+			{"use_for_new_sites": 0},
+			update_modified=False,
+		)
+
+	selected_bench_servers = list(decision["selected_bench_servers"] & set(server_names))
+	selected_site_servers = list(decision["selected_site_servers"] & set(server_names))
+	if selected_bench_servers:
+		frappe.db.set_value(
+			"Server",
+			{"name": ["in", selected_bench_servers]},
+			{"use_for_new_benches": 1},
+			update_modified=False,
+		)
+	if selected_site_servers:
+		frappe.db.set_value(
+			"Server",
+			{"name": ["in", selected_site_servers]},
+			{"use_for_new_sites": 1},
+			update_modified=False,
+		)
+
+
+def _get_public_server_health_metrics(server_names: list[str]) -> PublicServerHealthMetrics | None:
+	"""Fetch placement and alerting metrics for public servers from Prometheus."""
+	if not server_names:
+		return None
+
+	prometheus_connection = _get_public_server_pool_prometheus_connection()
+	if not prometheus_connection:
+		return None
+	url, auth = prometheus_connection
+
+	instance_matcher = "|".join(_escape_prometheus_regex_literal(name) for name in server_names)
+
+	available_memory_bytes_query = f'avg_over_time(node_memory_MemAvailable_bytes{{instance=~"^({instance_matcher})$", job="node"}}[60m])'
+	available_memory_ratio_query = (
+		f'avg_over_time(node_memory_MemAvailable_bytes{{instance=~"^({instance_matcher})$", job="node"}}[60m])'
+		f' / avg_over_time(node_memory_MemTotal_bytes{{instance=~"^({instance_matcher})$", job="node"}}[60m])'
+	)
+	cpu_idle_ratio_query = (
+		f'avg by (instance) (rate(node_cpu_seconds_total{{instance=~"^({instance_matcher})$", '
+		f'job="node", mode="idle"}}[60m]))'
+	)
+	disk_used_ratio_query = (
+		f'1 - (node_filesystem_avail_bytes{{instance=~"^({instance_matcher})$", job="node", '
+		f'device!~"rootfs", mountpoint="/"}} / node_filesystem_size_bytes{{'
+		f'instance=~"^({instance_matcher})$", job="node", device!~"rootfs", mountpoint="/"}})'
+	)
+	oom_kills_query = (
+		f'sum by (instance) (increase(node_vmstat_oom_kill{{instance=~"^({instance_matcher})$", '
+		f'job="node"}}[60m])) > 4'
+	)
+
+	available_memory_bytes_results = _query_prometheus_vector(available_memory_bytes_query, url, auth)
+	available_memory_ratio_results = _query_prometheus_vector(available_memory_ratio_query, url, auth)
+	cpu_idle_ratio_results = _query_prometheus_vector(cpu_idle_ratio_query, url, auth)
+	disk_used_ratio_results = _query_prometheus_vector(disk_used_ratio_query, url, auth)
+	oom_kills_results = _query_prometheus_vector(oom_kills_query, url, auth)
+
+	if (
+		available_memory_bytes_results is None
+		or available_memory_ratio_results is None
+		or cpu_idle_ratio_results is None
+	):
+		return None
+
+	return {
+		"available_memory_bytes": _build_public_server_metric_map(
+			server_names, available_memory_bytes_results
+		),
+		"available_memory_ratio": _build_public_server_metric_map(
+			server_names, available_memory_ratio_results
+		),
+		"cpu_idle_ratio": _build_public_server_metric_map(server_names, cpu_idle_ratio_results),
+		"disk_used_ratio": _build_public_server_metric_map(
+			server_names, disk_used_ratio_results, default=0.0
+		),
+		"oom_kills": _build_public_server_metric_map(server_names, oom_kills_results, default=0.0),
+	}
+
+
+def _get_public_server_pool_prometheus_connection() -> tuple[str, tuple[str, str]] | None:
+	monitor_server = frappe.db.get_single_value("Press Settings", "monitor_server")
+	if not monitor_server:
+		return None
+
+	url = f"https://{monitor_server}/prometheus/api/v1/query"
+	password = get_decrypted_password("Monitor Server", monitor_server, "grafana_password")
+	return url, ("frappe", str(password))
+
+
+def _escape_prometheus_regex_literal(value: str) -> str:
+	"""Escape a literal for a Prometheus RE2 regex label matcher."""
+	return PROMETHEUS_REGEX_META_CHAR_PATTERN.sub(r"\\\\\1", value)
+
+
+def _build_public_server_metric_map(
+	server_names: list[str],
+	results: list[dict] | None,
+	default: float | None = None,
+) -> dict[str, float]:
+	server_map: dict[str, float] = {}
+	if default is not None:
+		server_map = {name: default for name in server_names}
+	if results is None:
+		return server_map
+
+	server_name_set = set(server_names)
+	for result in results:
+		instance = result.get("metric", {}).get("instance")
+		if not instance or instance not in server_name_set:
+			continue
+		with suppress(KeyError, TypeError, ValueError):
+			server_map[instance] = float(result["value"][1])
+	return server_map
+
+
+def _query_prometheus_vector(query: str, url: str, auth: tuple[str, str]) -> list[dict] | None:
+	try:
+		response = requests.get(url, params={"query": query}, auth=auth, timeout=30)
+		data = response.json()
+	except (ValueError, requests.exceptions.RequestException) as exc:
+		log_error("Public Server Pool Prometheus Query Failed", query=query, exception=exc)
+		return None
+
+	if not response.ok:
+		log_error(
+			"Public Server Pool Prometheus Query Failed",
+			query=query,
+			status_code=response.status_code,
+			response=data,
+		)
+		return None
+
+	if data.get("status") != "success":
+		log_error("Public Server Pool Prometheus Query Failed", query=query, response=data)
+		return None
+
+	return data.get("data", {}).get("result")
+
+
+def _send_public_server_pool_health_alert(server_issues: dict[str, list[str]]) -> None:
+	if not server_issues:
+		return
+
+	affected_servers = sorted(server_issues)
+	header_lines = [
+		f"**Public Server Pool Health Alerts** - {len(affected_servers)}",
+		"",
+		"Thresholds: RAM utilization > 90%, CPU utilization > 50%, Disk Utilization > 90%, OOM kills > 4",
+		"",
+	]
+	table_header = [
+		"| Server | Health Issues |",
+		"| --- | --- |",
+	]
+
+	table_rows = []
+	for server in affected_servers:
+		issues = "<br>".join(_escape_markdown_table_cell(issue) for issue in server_issues[server])
+		table_rows.append(f"| {_escape_markdown_table_cell(server)} | {issues} |")
+
+	send_raven_message(
+		"\n".join(header_lines + table_header + table_rows).strip(), RAVEN_SERVER_ALERTS_CHANNEL
+	)
+
+
+def _escape_markdown_table_cell(value: str) -> str:
+	return value.replace("|", "\\|").replace("\n", "<br>")
+
+
+def _create_no_suitable_servers_incident(
+	fallback_servers_by_cluster: dict[str, str],
+	metrics: PublicServerHealthMetrics,
+) -> None:
+	if not fallback_servers_by_cluster:
+		return
+
+	subject = "No suitable public servers found"
+	if _open_public_server_pool_incident_exists(subject):
+		return
+
+	description_lines = [
+		"Public server pool health check found clusters without a suitable healthy server.",
+		"Least-bad fallback servers were selected so scheduling can continue.",
+		"",
+		"Fallback servers:",
+	]
+
+	for cluster, selected_server in sorted(fallback_servers_by_cluster.items()):
+		description_lines.extend(
+			[
+				"",
+				f"Cluster: {cluster}",
+				f"Selected fallback server: {selected_server}",
+				"Health issues:",
+			]
+		)
+		issues = _get_public_server_placement_issues(selected_server, metrics)
+		if issues:
+			description_lines.extend(f"- {issue}" for issue in issues)
+		else:
+			description_lines.append("- No hard RAM or CPU issue was recorded for the selected fallback.")
+
+	description_lines.extend(
+		[
+			"",
+			"Action required: provision new servers in these clusters or reduce load on existing servers.",
+		]
+	)
+
+	incident_values = {
+		"doctype": "Incident",
+		"type": "Server Down",
+		"subject": subject,
+		"description": "\n".join(description_lines),
+	}
+
+	if len(fallback_servers_by_cluster) == 1:
+		cluster, selected_server = next(iter(fallback_servers_by_cluster.items()))
+		incident_values["server"] = selected_server
+		incident_values["cluster"] = cluster
+
+	_insert_public_server_pool_incident(
+		incident_values,
+		"Failed to create no-suitable-server public pool incident",
+		fallback_servers_by_cluster=fallback_servers_by_cluster,
+	)
+
+
+def _insert_public_server_pool_incident(
+	incident_values: dict,
+	error_title: str,
+	**log_context,
+) -> None:
+	try:
+		incident = frappe.get_doc(incident_values)
+		incident.insert(ignore_permissions=True)
+	except Exception as exc:
+		log_error(error_title, exception=exc, **log_context)
+
+
+def _open_public_server_pool_incident_exists(subject: str, cluster: str | None = None) -> bool:
+	filters = {
+		"subject": subject,
+		"status": ["not in", ["Resolved", "Auto-Resolved", "Press-Resolved"]],
+	}
+	if cluster:
+		filters["cluster"] = cluster
+	return bool(frappe.db.exists("Incident", filters))
+
+
+def alert_on_failing_signups() -> None:
+	"""Alert when a large share of recent signups failed.
+
+	Two independent signals: product trial signups that errored out, and signups that
+	never became a team. Each is compared against its own ratio, over a volume floor,
+	so a single person walking away at 3am doesn't page anyone.
+	"""
+	rates = [_get_trial_signup_failure_rate(), _get_incomplete_signup_rate()]
+	breached = [rate for rate in rates if _breaches_signup_failure_threshold(rate)]
+	if breached:
+		_send_signup_failure_alert(breached)
+
+
+def _get_trial_signup_failure_rate() -> SignupFailureRate:
+	"""Product trial signups that settled in the window - errored out against site created.
+
+	Windowed on when the status last changed, not on creation: a request that took three
+	hours to fail is a failure this hour, and windowing on creation would drop it for
+	good, exactly when provisioning is slow enough to be the outage worth alerting on.
+	Not on `modified` either - a later write, like the accessibility check at login, would
+	drag a long-settled request into this window and alert on an outcome from yesterday.
+	"""
+	requests = frappe.get_all(
+		"Product Trial Request",
+		filters={
+			"status_updated_on": (
+				">",
+				frappe.utils.add_to_date(None, hours=-SIGNUP_ALERT_WINDOW_HOURS),
+			),
+			"status": ("in", ["Error", "Site Created"]),
+			"owner": ("not like", TEST_SIGNUP_EMAIL_PATTERN),
+		},
+		fields=["status", "product_trial"],
+	)
+	failed = [request for request in requests if request.status == "Error"]
+	return {
+		"label": "Product trial signups that errored out",
+		"failed": len(failed),
+		"total": len(requests),
+		"ratio_threshold": TRIAL_SIGNUP_FAILURE_RATIO_THRESHOLD,
+		"minimum_count": TRIAL_SIGNUP_MINIMUM_COUNT,
+		"breakdown": Counter(request.product_trial or "Unknown" for request in failed),
+		"link": frappe.utils.get_url("/app/product-trial-request?status=Error"),
+	}
+
+
+def _get_incomplete_signup_rate() -> SignupFailureRate:
+	"""Signups that asked for verification but never ended up with a team."""
+	emails = set(_get_signup_emails_past_grace_period())
+	teams = frappe.get_all("Team", filters={"user": ("in", list(emails))}, pluck="user") if emails else []
+	return {
+		"label": "Signups that never became a team",
+		"failed": len(emails - set(teams)),
+		"total": len(emails),
+		"ratio_threshold": INCOMPLETE_SIGNUP_RATIO_THRESHOLD,
+		"minimum_count": INCOMPLETE_SIGNUP_MINIMUM_COUNT,
+		"breakdown": {},
+		"link": frappe.utils.get_url("/app/account-request"),
+	}
+
+
+def _get_signup_emails_past_grace_period() -> list[str]:
+	"""Emails from signup requests old enough to have finished, but no older than the window.
+
+	Team invites are left out - a member joining an existing team is a different funnel.
+	"""
+	window_end = frappe.utils.add_to_date(None, hours=-SIGNUP_COMPLETION_GRACE_HOURS)
+	window_start = frappe.utils.add_to_date(window_end, hours=-SIGNUP_ALERT_WINDOW_HOURS)
+	return frappe.get_all(
+		"Account Request",
+		filters={
+			"creation": ("between", [window_start, window_end]),
+			"invited_by": ("is", "not set"),
+			"email": ("not like", TEST_SIGNUP_EMAIL_PATTERN),
+		},
+		pluck="email",
+	)
+
+
+def _breaches_signup_failure_threshold(rate: SignupFailureRate) -> bool:
+	if rate["total"] < rate["minimum_count"]:
+		return False
+	return rate["failed"] / rate["total"] > rate["ratio_threshold"]
+
+
+def _send_signup_failure_alert(rates: list[SignupFailureRate]) -> None:
+	lines = [f"**Signup Failure Alerts** - {len(rates)}", ""]
+	for rate in rates:
+		lines.append(_describe_signup_failure_rate(rate))
+		lines.extend(f"- {name}: {count}" for name, count in sorted(rate["breakdown"].items()))
+		lines.append("")
+
+	send_raven_message("\n".join(lines).strip(), RAVEN_SIGNUP_ALERTS_CHANNEL)
+
+
+def _describe_signup_failure_rate(rate: SignupFailureRate) -> str:
+	failure_ratio = rate["failed"] / rate["total"] * 100
+	return (
+		f"[{rate['label']}]({rate['link']}): {rate['failed']} of {rate['total']} "
+		f"({failure_ratio:.2f}%) in the last {SIGNUP_ALERT_WINDOW_HOURS}h, "
+		f"threshold {rate['ratio_threshold'] * 100:.0f}%"
+	)
+
+
+def alert_on_sites_with_missing_backups() -> None:
+	"""Daily Raven digest of sites that hit the daily failed backup limit or got no backup attempt at all."""
+	from press.press.doctype.site_backup.site_backup import get_max_failed_backup_attempts
+
+	max_attempts = get_max_failed_backup_attempts()
+	failed_sites = _get_sites_with_all_backup_attempts_failed(max_attempts)
+	missed_sites = _get_sites_without_backup_attempts()
+	if failed_sites or missed_sites:
+		_send_missing_backups_alert(failed_sites, missed_sites, max_attempts)
+
+
+def _get_sites_with_all_backup_attempts_failed(max_attempts: int) -> list[frappe._dict]:
+	"""Sites that hit the daily failed backup limit, the same limit that emails the team."""
+	failures_by_site = frappe.get_all(
+		"Site Backup",
+		filters={
+			"status": ("in", ["Failure", "Delivery Failure"]),
+			"creation": (">=", frappe.utils.add_days(None, -1)),
+		},
+		fields=["site", "count(name) as failures"],
+		group_by="site",
+		order_by="failures desc, site asc",
+	)
+	return [row for row in failures_by_site if row.failures >= max_attempts]
+
+
+def _get_sites_without_backup_attempts() -> list[str]:
+	"""Sites due a scheduled backup that have no backup record of any status in the last 24h."""
+	from press.press.doctype.site.site import Site
+
+	sites_due = [site.name for site in Site.get_sites_for_backup(24)]
+	if not sites_due:
+		return []
+
+	since = frappe.utils.add_days(None, -1)
+	attempted_sites = frappe.get_all(
+		"Site Backup", {"site": ("in", sites_due), "creation": (">=", since)}, pluck="site"
+	)
+	# A site deactivated for part of the day was never due a backup
+	activated_sites = frappe.get_all(
+		"Site Activity",
+		{"site": ("in", sites_due), "action": "Activate Site", "creation": (">=", since)},
+		pluck="site",
+	)
+	return sorted(set(sites_due) - set(attempted_sites) - set(activated_sites))
+
+
+def _send_missing_backups_alert(
+	failed_sites: list[frappe._dict], missed_sites: list[str], max_attempts: int
+) -> None:
+	tables = []
+	if failed_sites:
+		tables.append(_get_failed_backups_table(failed_sites, max_attempts))
+	if missed_sites:
+		tables.append(_get_missed_backups_table(missed_sites))
+	send_raven_message("\n\n".join(tables), RAVEN_SERVER_ALERTS_CHANNEL)
+
+
+def _get_failed_backups_table(failed_sites: list[frappe._dict], max_attempts: int) -> str:
+	listed_sites = failed_sites[:BACKUP_DIGEST_SITE_LIMIT]
+	site_details = _get_backup_digest_site_details([row.site for row in listed_sites])
+
+	lines = [
+		f"**Sites With All Backup Attempts Failed** - {len(failed_sites)}",
+		"",
+		f"Sites with {max_attempts} or more failed backups in the last 24h",
+		"",
+		"| Site | Server | Plan | Team Email | Failed Backups | Last Successful Backup |",
+		"| --- | --- | --- | --- | --- | --- |",
+	]
+	for row in listed_sites:
+		site = site_details[row.site]
+		link = frappe.utils.get_url(f"/app/site-backup?site={row.site}&status=Failure")
+		cells = [
+			f"[{_escape_markdown_table_cell(row.site)}]({link})",
+			site.server,
+			site.plan,
+			site.team_email,
+			str(row.failures),
+			site.last_success,
+		]
+		lines.append(f"| {' | '.join(cells)} |")
+
+	if unlisted_sites := len(failed_sites) - len(listed_sites):
+		lines.append(f"| ... | {unlisted_sites} more sites | | | | |")
+	return "\n".join(lines)
+
+
+def _get_missed_backups_table(missed_sites: list[str]) -> str:
+	listed_sites = missed_sites[:BACKUP_DIGEST_SITE_LIMIT]
+	site_details = _get_backup_digest_site_details(listed_sites)
+
+	lines = [
+		f"**Sites Without Any Backup Attempt** - {len(missed_sites)}",
+		"",
+		"Sites due a scheduled backup with no backup attempt in the last 24h",
+		"",
+		"| Site | Server | Plan | Team Email | Last Successful Backup |",
+		"| --- | --- | --- | --- | --- |",
+	]
+	for name in listed_sites:
+		site = site_details[name]
+		link = frappe.utils.get_url(f"/app/site/{name}")
+		cells = [
+			f"[{_escape_markdown_table_cell(name)}]({link})",
+			site.server,
+			site.plan,
+			site.team_email,
+			site.last_success,
+		]
+		lines.append(f"| {' | '.join(cells)} |")
+
+	if unlisted_sites := len(missed_sites) - len(listed_sites):
+		lines.append(f"| ... | {unlisted_sites} more sites | | | |")
+	return "\n".join(lines)
+
+
+def _get_backup_digest_site_details(site_names: list[str]) -> dict[str, frappe._dict]:
+	"""Table cells for the server, plan, team email and last successful backup of each site."""
+	sites = {
+		site.name: site
+		for site in frappe.get_all("Site", {"name": ("in", site_names)}, ["name", "server", "team", "plan"])
+	}
+	plans = {
+		plan.name: plan
+		for plan in frappe.get_all(
+			"Site Plan",
+			{"name": ("in", list({site.plan for site in sites.values() if site.plan}))},
+			["name", "price_usd", "dedicated_server_plan"],
+		)
+	}
+	team_emails = dict(
+		frappe.get_all(
+			"Team",
+			{"name": ("in", list({site.team for site in sites.values() if site.team}))},
+			["name", "user"],
+			as_list=True,
+		)
+	)
+	last_successes = dict(
+		frappe.get_all(
+			"Site Backup",
+			filters={"site": ("in", site_names), "status": "Success"},
+			fields=["site", "max(creation) as last_success"],
+			group_by="site",
+			as_list=True,
+		)
+	)
+
+	details = {}
+	for name in site_names:
+		site = sites.get(name) or frappe._dict()
+		last_success = last_successes.get(name)
+		details[name] = frappe._dict(
+			server=_escape_markdown_table_cell(site.server or "-"),
+			plan=_describe_site_plan(plans.get(site.plan)),
+			team_email=_escape_markdown_table_cell(team_emails.get(site.team) or "-"),
+			last_success=last_success.strftime("%Y-%m-%d %H:%M") if last_success else "Never",
+		)
+	return details
+
+
+def _describe_site_plan(plan: frappe._dict | None) -> str:
+	if not plan:
+		return "-"
+	if plan.dedicated_server_plan:
+		return "Dedicated"
+	return f"${float(plan.price_usd):g}/mo"

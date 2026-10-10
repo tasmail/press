@@ -23,6 +23,7 @@ class SiteGroupDeploy(Document):
 		cluster: DF.Link
 		provider: DF.Link | None
 		release_group: DF.Link | None
+		server: DF.Link | None
 		site: DF.Link | None
 		site_plan: DF.Link | None
 		status: DF.Literal[
@@ -42,6 +43,7 @@ class SiteGroupDeploy(Document):
 	dashboard_fields = ("status", "site", "release_group")
 
 	def before_insert(self):
+		self.check_if_team_can_create_site()
 		self.set_latest_version()
 		self.check_if_rg_or_site_exists()
 
@@ -62,6 +64,12 @@ class SiteGroupDeploy(Document):
 
 		self.version = frappe.db.get_value("Frappe Version", {"status": "stable"}, order_by="number desc")
 
+	def check_if_team_can_create_site(self):
+		team = frappe.get_doc("Team", self.team)
+		[allow_creation, why] = team.can_create_site()
+		if not allow_creation:
+			frappe.throw(why)
+
 	def check_if_rg_or_site_exists(self):
 		from press.press.doctype.site.site import Site
 
@@ -73,33 +81,20 @@ class SiteGroupDeploy(Document):
 			frappe.throw(f"Site with subdomain {self.subdomain} already exists")
 
 	def get_optimal_server_for_private_bench(self):
-		servers = frappe.get_all(
-			"Server",
-			filters={
-				"status": "Active",
-				"cluster": self.cluster,
-				"provider": self.provider,
-				"public": True,
-			},
-			fields=["name", "ram"],
-		)
-
-		if not servers:
-			return None
-
-		server_stats = []
-		for server in servers:
-			bench_count = frappe.db.count("Bench", {"server": server.name, "status": "Active"})
-			resource_ratio = server.ram / (bench_count + 1)
-			server_stats.append(
-				{
-					"name": server.name,
-					"resource_ratio": resource_ratio,
-				}
+		Server = frappe.qb.DocType("Server")
+		server = (
+			frappe.qb.from_(Server)
+			.select(Server.name)
+			.where(
+				(Server.status == "Active")
+				& (Server.cluster == self.cluster)
+				& (Server.provider == self.provider)
+				& (Server.public == 1)
 			)
+			.orderby(Server.use_for_new_benches, order=frappe.qb.desc)
+		).run(pluck=True)
 
-		server_stats.sort(key=lambda x: -x["resource_ratio"])
-		return server_stats[0]["name"] if server_stats else None
+		return server[0] if server else None
 
 	def create_release_group(self):
 		from press.press.doctype.release_group.release_group import (
@@ -108,9 +103,8 @@ class SiteGroupDeploy(Document):
 
 		apps = [{"app": app.app, "source": app.source} for app in self.apps]
 
-		server = ""
-		if self.auto_provision_bench and self.provider:
-			server = self.get_optimal_server_for_private_bench()
+		if not self.server and self.auto_provision_bench and self.provider:
+			self.server = self.get_optimal_server_for_private_bench()
 
 		group = new_release_group(
 			title=self.subdomain,
@@ -118,7 +112,8 @@ class SiteGroupDeploy(Document):
 			apps=apps,
 			team=self.team,
 			cluster=self.cluster,
-			server=server if server else None,
+			server=self.server or None,
+			check_dependent_apps=True,
 		)
 
 		self.release_group = group.name
