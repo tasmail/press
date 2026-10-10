@@ -20,6 +20,8 @@ from oci.core.models.image_source_via_object_storage_uri_details import (
 from tenacity import retry, stop_after_attempt, wait_fixed
 from tenacity.retry import retry_if_result
 
+from press.frappe_compute_client.client import Client as FrappeComputeClient
+
 
 class VirtualMachineImage(Document):
 	# begin: auto-generated types
@@ -62,7 +64,9 @@ class VirtualMachineImage(Document):
 		if (
 			self.cloud_provider == "Hetzner" or self.cloud_provider == "DigitalOcean"
 		) and self.has_data_volume:
-			frappe.throw("Hetzner Virtual Machine Images cannot have data volumes.")
+			frappe.throw(
+				"Hetzner and Digital Ocean machine images can't include data volumes. Please create the image without a data volume, or use an AWS EC2 machine."
+			)
 
 		if self.cloud_provider == "DigitalOcean":
 			snapshots = self.client.droplets.list_snapshots(self.instance_id)
@@ -135,6 +139,10 @@ class VirtualMachineImage(Document):
 			)
 			action = action["action"]
 			self.action_id = action["id"]
+
+		elif cluster.cloud_provider == "Frappe Compute":
+			self.image_id = self.client.create_virtual_machine_image(self.instance_id)
+
 		self.sync()
 
 	def create_image_from_copy(self):
@@ -265,6 +273,11 @@ class VirtualMachineImage(Document):
 				self.size = image["min_disk_size"]
 				self.root_size = image["min_disk_size"]
 
+		elif cluster.cloud_provider == "Frappe Compute":
+			image = self.client.sync_virtual_machine_image(self.image_id)
+			self.root_size = image.size
+			self.size = image.size
+			self.status = image.status
 		self.save()
 		return self.status
 
@@ -360,6 +373,12 @@ class VirtualMachineImage(Document):
 			return Client(token=api_token)
 		if cluster.cloud_provider == "DigitalOcean":
 			return pydo.Client(token=cluster.get_password("digital_ocean_api_token"))
+		if cluster.cloud_provider == "Frappe Compute":
+			return FrappeComputeClient(
+				url=cluster.frappe_compute_base_url,
+				api_key=cluster.frappe_compute_api_key,
+				api_secret=cluster.get_password("frappe_compute_api_secret"),
+			)
 		return None
 
 	@classmethod

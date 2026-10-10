@@ -13,8 +13,10 @@ from botocore.exceptions import ClientError
 from frappe.core.utils import find
 from frappe.desk.doctype.tag.tag import add_tag
 from frappe.query_builder import Case
+from frappe.query_builder.functions import Count
 from frappe.rate_limiter import rate_limit
-from frappe.utils import flt, sbool, time_diff_in_hours
+from frappe.utils import cint, flt, sbool, time_diff_in_hours
+from frappe.utils.data import format_datetime, get_datetime
 from frappe.utils.password import get_decrypted_password
 from frappe.utils.typing_validations import validate_argument_types
 from frappe.utils.user import is_system_user
@@ -22,16 +24,29 @@ from frappe.utils.user import is_system_user
 from press.access.support_access import has_support_access
 from press.guards import role_guard
 from press.press.doctype.agent_job.agent_job import job_detail
+from press.press.doctype.app.app import get_app_from_policies
 from press.press.doctype.marketplace_app.marketplace_app import (
 	get_plans_for_app,
 	get_total_installs_by_app,
 )
-from press.press.doctype.remote_file.remote_file import get_remote_key
+from press.press.doctype.remote_file.remote_file import get_remote_key, validate_files_belong_to_team
+from press.press.doctype.root_domain.root_domain import get_matching_domain
 from press.press.doctype.server.server import is_dedicated_server
-from press.press.doctype.site.site import Site, get_updates_between_current_and_next_apps
+from press.press.doctype.site.site import (
+	Site,
+	get_updates_between_current_and_next_apps,
+)
+from press.press.doctype.site.site_plan_utils import (
+	attach_warranty_info_to_dedicated_servers,
+	get_available_warranty_quota_for_server,
+	get_next_allowed_dedicated_product_warranty_change_date,
+	is_product_warranty_enabled_for_plan_,
+)
+from press.press.doctype.site_config.site_config import parse_json_config_value
 from press.press.doctype.site_plan.plan import Plan
 from press.press.doctype.site_update.site_update import benches_with_available_update
 from press.utils import (
+	_system_user,
 	get_client_blacklisted_keys,
 	get_current_team,
 	get_frappe_backups,
@@ -78,18 +93,23 @@ def protected(doctypes):
 
 		# Get the name of the document being accessed.
 		if not (docname := get_protected_doctype_name(args, kwargs, doctypes)):
-			frappe.throw("Name not found, API access not permitted", frappe.PermissionError)
+			frappe.throw("Name not found, API access not permitted", frappe.PermissionError)  # nosemgrep
 
 		current_team = get_current_team()
 		for doctype in doctypes:
-			document_team = frappe.db.get_value(doctype, docname, "team")
-			if document_team == current_team or has_support_access(doctype, docname):
+			if has_protected_access(doctype, docname, current_team):
 				return wrapped(*args, **kwargs)
 
-		frappe.throw("Not Permitted", frappe.PermissionError)
+		frappe.throw("Not Permitted", frappe.PermissionError)  # nosemgrep
 		return None
 
 	return wrapper
+
+
+def has_protected_access(doctype: str, docname: str, team: str) -> bool:
+	if frappe.db.get_value(doctype, docname, "team") == team:
+		return role_guard.permits(doctype, docname)
+	return has_support_access(doctype, docname)
 
 
 def get_protected_doctype_name(args: list, kwargs: dict, doctypes: list[str]):
@@ -121,25 +141,38 @@ def get_name_from_filters(filters: dict):
 		return None
 
 	value = values[0]
-	if isinstance(value, (int, str)):
+	if isinstance(value, int | str):
 		return value
 
 	return None
 
 
+def validate_files_for_new_site(files: dict, team: str):
+	"""Site Replication creates the site from desk, under the operator's own team."""
+	if _system_user():
+		return
+
+	validate_files_belong_to_team(files, team)
+
+
 def _new(site, server: str | None = None, ignore_plan_validation: bool = False):
 	team = get_current_team(get_doc=True)
 	if not team.enabled:
-		frappe.throw("You cannot create a new site because your account is disabled")
+		frappe.throw(
+			"You cannot create a new site because your account is disabled. Please <b>create a new account</b> or reach out to us at <a href='https://support.frappe.io'>support.frappe.io</a>"
+		)
 
 	files = site.get("files", {})
+	validate_files_for_new_site(files, team.name)
 
 	apps = [{"app": app} for app in site["apps"]]
 
 	group = get_group_for_new_site_and_set_localisation_app(site, apps)
 	domain = site.get("domain")
 	if not (domain and frappe.db.exists("Root Domain", {"name": domain})):
-		frappe.throw("No root domain for site")
+		frappe.throw(
+			"The site does not have a root domain set. Please <b>setup a root domain</b> for the site."
+		)
 
 	cluster = site.get("cluster") or frappe.db.get_single_value("Press Settings", "cluster")
 
@@ -167,20 +200,21 @@ def _new(site, server: str | None = None, ignore_plan_validation: bool = False):
 		.where(Bench.status == "Active")
 		.where(Bench.group == site["group"])
 		.orderby(Case().when(Bench.cluster == cluster, 1).else_(0), order=frappe.qb.desc)
-		.orderby(Server.use_for_new_sites, order=frappe.qb.desc)
 		.orderby(Bench.creation, order=frappe.qb.desc)
 		.limit(1)
 	)
 
 	if server:
 		bench_query = bench_query.where(Server.name == server)
+	else:
+		bench_query.orderby(Server.use_for_new_sites, order=frappe.qb.desc)
 
 	bench = bench_query.run(as_dict=True).pop()
 
 	plan = site["plan"]
 	app_plans = site.get("selected_app_plans")
 	if not ignore_plan_validation:
-		validate_plan(bench.server, plan)
+		validate_plan(bench.server, site.get("name"), plan, is_new=True)
 
 	site = frappe.get_doc(
 		{
@@ -231,14 +265,36 @@ def _new(site, server: str | None = None, ignore_plan_validation: bool = False):
 	}
 
 
+def get_localisation_apps_for_country(country, apps):
+	"""Return the localisation marketplace apps for the country.
+
+	Multiple marketplace apps can define a localisation app for the same
+	country, so return every one whose parent marketplace app is among the
+	apps being installed instead of an arbitrary single match.
+	"""
+	app_names = [app["app"] for app in apps]
+	MarketplaceLocalisationApp = frappe.qb.DocType("Marketplace Localisation App")
+	MarketplaceApp = frappe.qb.DocType("Marketplace App")
+	return (
+		frappe.qb.from_(MarketplaceLocalisationApp)
+		.join(MarketplaceApp)
+		.on(MarketplaceLocalisationApp.parent == MarketplaceApp.name)
+		.select(MarketplaceLocalisationApp.marketplace_app)
+		.where(MarketplaceLocalisationApp.country == country)
+		.where(MarketplaceApp.app.isin(app_names or [""]))
+		.run(pluck="marketplace_app")
+	)
+
+
 def get_group_for_new_site_and_set_localisation_app(site, apps):
 	if not (localisation_country := site.get("localisation_country")):
 		return site.get("group")
 
-	# if localisation country is selected, move site to a public bench with the same localisation app
-	localisation_app = frappe.db.get_value(
-		"Marketplace Localisation App", {"country": localisation_country}, "marketplace_app"
-	)
+	# if localisation country is selected, move site to a public bench with the same localisation apps
+	localisation_apps = get_localisation_apps_for_country(localisation_country, apps)
+	if not localisation_apps:
+		# none of the selected apps require a localisation app for this country
+		return site.get("group")
 	restricted_release_group_names = frappe.db.get_all(
 		"Site Plan Release Group",
 		pluck="release_group",
@@ -251,57 +307,279 @@ def get_group_for_new_site_and_set_localisation_app(site, apps):
 		.select(ReleaseGroup.name)
 		.join(ReleaseGroupApp)
 		.on(ReleaseGroup.name == ReleaseGroupApp.parent)
-		.where(ReleaseGroupApp.app == localisation_app)
+		.where(ReleaseGroupApp.app.isin(localisation_apps or [""]))
 		.where(ReleaseGroup.public == 1)
 		.where(ReleaseGroup.enabled == 1)
 		.where(ReleaseGroup.name.notin(restricted_release_group_names or [""]))
 		.where(ReleaseGroup.version == site.get("version"))
+		.groupby(ReleaseGroup.name)
+		.having(Count(ReleaseGroupApp.app).distinct() == len(localisation_apps))
 		.run(pluck="name")
 	)
 	if not groups:
 		frappe.throw(
-			f"Localisation app for {frappe.bold(localisation_country)} is not available for version {frappe.bold(site.get('version'))}"
-		)
+			f"Localisation app for {frappe.bold(localisation_country)} is not available for version {site.get('version')}"
+		)  # nosemgrep
 
-	apps.append({"app": localisation_app})
+	apps.extend({"app": app} for app in localisation_apps)
 	return groups[0]
 
 
+def _validate_warranty_change(
+	is_new: bool,
+	is_system_user: bool,
+	is_current_dedicated_server_plan: bool,
+	is_current_plan_supported: bool,
+	new_plan: str,
+	site: str,
+	server: str,
+) -> None:
+	"""Throw if a warranty-affecting plan change is not allowed at this time."""
+	if is_new or is_system_user or not is_current_dedicated_server_plan:
+		return
+	is_new_plan_supported = is_product_warranty_enabled_for_plan_(new_plan)
+	if is_current_plan_supported == is_new_plan_supported:
+		return
+	if is_new_plan_supported:
+		# Enabling warranty is gated only by the server quota (it consumes a slot).
+		# The cooldown deliberately does not apply: the only enable the cooldown
+		# would block is a site reclaiming the slot it itself just gave up, which
+		# is legitimate as long as a slot is free. Rotating support to a *different*
+		# site is already prevented by the quota plus the cooldown on disabling.
+		quota = get_available_warranty_quota_for_server(server)
+		if quota.get("available") <= 0:
+			frappe.throw(
+				"You have exhausted the site warranty quota for this server. To increase limit, please contact support."
+			)
+		return
+	# Disabling warranty is gated by the cooldown to deter freeing a slot only to
+	# rotate it onto another site.
+	next_warranty_change = get_next_allowed_dedicated_product_warranty_change_date(site)
+	if get_datetime() < next_warranty_change:
+		pretty_date = format_datetime(next_warranty_change, "MMM d, YYYY hh:mm a")
+		frappe.throw(f"Cannot change product warranty for this site before {pretty_date}")  # nosemgrep
+
+
+def _is_free_dedicated_plan_allowed(server: str, new_site_plan: dict) -> bool:
+	"""Return True when a zero-price dedicated plan is permitted for *server*."""
+	if not new_site_plan.get("dedicated_server_plan", 0):
+		return False
+	if frappe.db.get_value("Server", server, "team") != get_current_team():
+		return False
+	if not new_site_plan.get("restrict_based_on_dedicated_server_plan", 0):
+		return True
+	min_price = new_site_plan.get("minimum_server_price_usd", 0)
+	return get_dedicated_server_price(server) >= min_price
+
+
+def get_dedicated_server_price(server: str) -> float:
+	"""Combined monthly USD cost of a dedicated server: app server plan + its database server plan."""
+	app_server_plan, database_server = frappe.db.get_value("Server", server, ["plan", "database_server"])
+	app_server_price = frappe.db.get_value("Server Plan", app_server_plan, "price_usd") or 0
+
+	database_server_price = 0
+	if database_server:
+		database_server_plan = frappe.db.get_value("Database Server", database_server, "plan")
+		database_server_price = frappe.db.get_value("Server Plan", database_server_plan, "price_usd") or 0
+
+	return app_server_price + database_server_price
+
+
 @validate_argument_types
-def validate_plan(server: str, plan: str) -> None:
-	if not frappe.db.exists("Site Plan", plan):
-		frappe.throw(f"Plan {plan} does not exist", frappe.DoesNotExistError)
-	if (
-		frappe.db.get_value("Site Plan", plan, "price_usd") > 0
-		or frappe.db.get_value("Site Plan", plan, "dedicated_server_plan") == 1
-	):
+def validate_plan(server: str, site: str, new_plan: str, is_new: bool = False) -> None:
+	if not frappe.db.exists("Site Plan", new_plan):
+		frappe.throw(f"Plan {new_plan} does not exist", frappe.DoesNotExistError)  # nosemgrep
+
+	if is_new:
+		is_current_plan_supported, is_current_dedicated_server_plan = False, False
+	else:
+		plan_name = frappe.get_value("Site", site, "plan")
+		if not plan_name:
+			is_current_plan_supported = False
+			is_current_dedicated_server_plan = False
+		else:
+			is_current_plan_supported, is_current_dedicated_server_plan = frappe.db.get_value(
+				"Site Plan",
+				plan_name,
+				["support_included", "dedicated_server_plan"],
+			) or (False, False)
+
+	new_site_plan = frappe.db.get_value(
+		"Site Plan",
+		new_plan,
+		[
+			"price_usd",
+			"dedicated_server_plan",
+			"restrict_based_on_dedicated_server_plan",
+			"minimum_server_price_usd",
+		],
+		as_dict=True,
+	)
+
+	is_system_user = frappe.session.data.user_type == "System User"
+
+	_validate_warranty_change(
+		is_new,
+		is_system_user,
+		is_current_dedicated_server_plan,
+		is_current_plan_supported,
+		new_plan,
+		site,
+		server,
+	)
+
+	if new_site_plan.get("price_usd", 0) > 0:
 		return
-	if (
-		frappe.session.data.user_type == "System User"
-		or frappe.db.get_value("Server", server, "team") == get_current_team()
-	):
+
+	if _is_free_dedicated_plan_allowed(server, new_site_plan):
 		return
-	frappe.throw("You are not allowed to use this plan")
+
+	if frappe.session.data.user_type == "System User":
+		return
+
+	frappe.throw("You are not allowed to use this plan")  # nosemgrep
 
 
 @frappe.whitelist()
 def new(site):
+	"""
+	Dedicated server flow:
+	- Search for existing bench group with matching version and selected apps deployed on selected server
+	- Reuse group if found, otherwise provision new bench and create site
+
+	Shared/public server flow:
+	- If plans supports it, deploy private bench and create site
+	- Else create site on shared bench
+	"""
 	if not hasattr(site, "domain") and not site.get("domain"):
 		site["domain"] = frappe.db.get_single_value("Press Settings", "domain")
 
+	selected_dedicated_server = site.get("server")
 	plan = site.get("plan")
+	apps = site.get("apps", ["frappe"])
+	apps = [app for app in apps if app]
+
+	if selected_dedicated_server:
+		if localisation_country := site.get("localisation_country"):
+			localisation_app = frappe.db.get_value(
+				"Marketplace Localisation App",
+				{"country": localisation_country},
+				"marketplace_app",
+			)
+			if localisation_app and localisation_app not in apps:
+				apps.append(localisation_app)
+
+		version = site.get("version")
+		existing_release_group = _get_existing_bench_group_for_dedicated_server(
+			server=selected_dedicated_server,
+			version=version,
+			apps=apps,
+		)
+		if existing_release_group:
+			team = get_current_team(get_doc=True)
+			app_plans = site.get("selected_app_plans")
+			site_doc = frappe.get_doc(
+				{
+					"doctype": "Site",
+					"subdomain": site.get("name"),
+					"domain": site.get("domain"),
+					"group": existing_release_group,
+					"server": selected_dedicated_server,
+					"cluster": site.get("cluster"),
+					"apps": [{"app": app} for app in apps],
+					"app_plans": app_plans,
+					"team": team.name,
+					"free": team.free_account,
+					"subscription_plan": plan,
+					"version": version,
+				},
+			)
+			site_doc.insert(ignore_permissions=True)
+
+			return {
+				"site": site_doc.name,
+				"job": frappe.db.get_value(
+					"Agent Job",
+					filters={
+						"site": site_doc.name,
+						"job_type": ("in", ["New Site", "New Site from Backup"]),
+					},
+				),
+			}
+		apps = site.get("apps")
+		return create_site_on_private_bench(
+			subdomain=site.get("name"),
+			plan=plan,
+			cluster=site.get("cluster"),
+			apps=apps,
+			version=version,
+			provider=site.get("provider"),
+			localisation_country=localisation_country,
+			server=selected_dedicated_server,
+		)
+
 	if frappe.db.get_value("Site Plan", plan, "private_bench_support"):
 		return create_site_on_private_bench(
 			subdomain=site.get("name"),
 			plan=plan,
 			cluster=site.get("cluster"),
-			apps=site.get("apps", ["frappe"]),
+			apps=apps,
 			version=site.get("version"),
 			provider=site.get("provider"),
 			localisation_country=site.get("localisation_country"),
 		)
 
 	return _new(site)
+
+
+def _get_existing_bench_group_for_dedicated_server(
+	server: str,
+	version: str,
+	apps: list[str],
+) -> str | None:
+	"""
+	Find an existing bench group deployed on the selected server that matches version and  includes all selected apps
+	"""
+	team = get_current_team()
+	selected_apps = {app for app in apps if app}
+	if not selected_apps or not version or not server:
+		return None
+
+	# Query benches on the selected server with matching app list
+	Bench = frappe.qb.DocType("Bench")
+	ReleaseGroup = frappe.qb.DocType("Release Group")
+
+	benches = (
+		frappe.qb.from_(Bench)
+		.join(ReleaseGroup)
+		.on(Bench.group == ReleaseGroup.name)
+		.select(Bench.group)
+		.where(Bench.server == server)
+		.where(Bench.team == team)
+		.where(Bench.status == "Active")
+		.where(ReleaseGroup.version == version)
+		.where(ReleaseGroup.enabled == 1)
+	).run(as_dict=True)
+
+	if not benches:
+		return None
+
+	release_groups = list({bench["group"] for bench in benches})
+	group_apps = frappe.db.get_all(
+		"Release Group App",
+		filters={"parent": ("in", release_groups)},
+		fields=["parent", "app"],
+	)
+	apps_by_group: dict[str, set[str]] = {}
+	for row in group_apps:
+		apps_by_group.setdefault(row.parent, set()).add(row.app)
+
+	for bench in benches:
+		bench_apps = apps_by_group.get(bench["group"], set())
+		if selected_apps.issubset(bench_apps):
+			return bench["group"]
+
+	return None
 
 
 def create_site_on_private_bench(
@@ -312,12 +590,15 @@ def create_site_on_private_bench(
 	version: str,
 	provider: str,
 	localisation_country: str | None = None,
+	server: str = "",
 ) -> dict:
 	team = get_current_team()
 
 	if localisation_country:
 		localisation_app = frappe.db.get_value(
-			"Marketplace Localisation App", {"country": localisation_country}, "marketplace_app"
+			"Marketplace Localisation App",
+			{"country": localisation_country},
+			"marketplace_app",
 		)
 		if localisation_app:
 			apps.append(localisation_app)
@@ -360,7 +641,7 @@ def create_site_on_private_bench(
 	sources = {x.app: x.source for x in frappe_app_source + app_sources}
 	for app in apps:
 		if app not in sources:
-			frappe.throw(f"Source not found for app {app}")
+			frappe.throw(f"Source not found for app {app}. Please verify for a valid app source.")
 
 		apps_with_sources.append({"app": app, "source": sources[app]})
 
@@ -376,6 +657,7 @@ def create_site_on_private_bench(
 			"version": version,
 			"team": team,
 			"provider": provider,
+			"server": server,
 		}
 	).insert(ignore_permissions=True)
 
@@ -433,22 +715,31 @@ def jobs(filters=None, order_by=None, limit_start=None, limit_page_length=None):
 	return jobs
 
 
+def _get_job_team(job_doc) -> str | None:
+	if job_doc.site:
+		return frappe.db.get_value("Site", job_doc.site, "team")
+	if job_doc.bench:
+		return frappe.db.get_value("Bench", job_doc.bench, "team")
+	if job_doc.server:
+		server_type = frappe.db.get_value("Agent Job", job_doc.name, "server_type")
+		if server_type == "Server":
+			return frappe.db.get_value("Server", job_doc.server, "team")
+		if server_type == "Database Server":
+			return frappe.db.get_value("Database Server", job_doc.server, "team")
+	return None
+
+
 @frappe.whitelist()
 def job(job):
-	job = frappe.get_doc("Agent Job", job)
-	job = job.as_dict()
-	whitelisted_fields = [
-		"name",
-		"job_type",
-		"creation",
-		"status",
-		"start",
-		"end",
-		"duration",
-	]
-	for key in list(job.keys()):
-		if key not in whitelisted_fields:
-			job.pop(key, None)
+	job_doc = frappe.get_doc("Agent Job", job)
+
+	job_team = _get_job_team(job_doc)
+	current_team = get_current_team()
+	if job_team and job_team != current_team:
+		frappe.throw("Not permitted to access this job", frappe.PermissionError)
+
+	whitelisted_fields = {"name", "job_type", "creation", "status", "start", "end", "duration"}
+	job = frappe._dict({k: v for k, v in job_doc.as_dict().items() if k in whitelisted_fields})
 
 	if job.status == "Undelivered":
 		job.status = "Pending"
@@ -467,6 +758,22 @@ def job(job):
 def running_jobs(name):
 	jobs = frappe.get_all("Agent Job", filters={"status": ("in", ("Pending", "Running")), "site": name})
 	return [job_detail(job.name) for job in jobs]
+
+
+@frappe.whitelist()
+@protected("Site")
+def backup_history(name: str, start_date: str, end_date: str, refresh: bool = False):
+	"""Whether a backup was taken on each day of the range, answered even for days the list hides.
+
+	Deliberately not a doc method: the page asks repeatedly while a trail is being built,
+	and run_doc_method returns the whole Site document with every answer.
+	"""
+	from press.press.doctype.site_backup.backup_history import get_backup_history
+
+	if not isinstance(name, str):
+		frappe.throw("Could not read the site name. Give it as text, for example demo.frappe.cloud.")
+
+	return get_backup_history(name, start_date, end_date, refresh=cint(refresh))
 
 
 @frappe.whitelist()
@@ -516,8 +823,15 @@ def backups(name):
 @frappe.whitelist()
 @protected("Site")
 def get_backup_link(name, backup, file):
+	if file not in ["database", "public", "private", "config"]:
+		frappe.throw("Invalid file type")  # nosemgrep
+
 	try:
-		remote_file = frappe.db.get_value("Site Backup", backup, f"remote_{file}_file")
+		remote_file = frappe.db.get_value(
+			"Site Backup",
+			{"name": backup, "site": name},
+			f"remote_{file}_file",
+		)
 		return frappe.get_doc("Remote File", remote_file).download_link
 	except ClientError:
 		log_error(title="Offsite Backup Response Exception")
@@ -537,28 +851,6 @@ def domains(name):
 		primary.primary = True
 	domains.sort(key=lambda domain: not domain.primary)
 	return domains
-
-
-@frappe.whitelist()
-def activities(filters=None, order_by=None, limit_start=None, limit_page_length=None):
-	# get all site activity except Backup by Administrator
-	SiteActivity = frappe.qb.DocType("Site Activity")
-	activities = (
-		frappe.qb.from_(SiteActivity)
-		.select(SiteActivity.action, SiteActivity.reason, SiteActivity.creation, SiteActivity.owner)
-		.where(SiteActivity.site == filters["site"])
-		.where((SiteActivity.action != "Backup") | (SiteActivity.owner != "Administrator"))
-		.orderby(SiteActivity.creation, order=frappe.qb.desc)
-		.offset(limit_start)
-		.limit(limit_page_length)
-		.run(as_dict=True)
-	)
-
-	for activity in activities:
-		if activity.action == "Create":
-			activity.action = "Site Created"
-
-	return activities
 
 
 @frappe.whitelist()
@@ -619,7 +911,7 @@ def app_details_for_new_public_site():
 	return marketplace_apps
 
 
-def get_dedicated_server_info(release_group_name: str) -> dict:
+def _get_dedicated_server_info_for_release_group(release_group_name: str) -> dict:
 	"""
 	check servers linked to a release group and determine dedicated server deployment options.
 
@@ -628,7 +920,7 @@ def get_dedicated_server_info(release_group_name: str) -> dict:
 		- "dedicated_only_single" - exactly one dedicated server
 		- "dedicated_only_multiple" - multiple dedicated servers
 		- "user_choice_single" - one dedicated server and other public server(s)
-		"user_choice_multiple" - multiple dedicated servers and public server(s)
+		- "user_choice_multiple" - multiple dedicated servers and public server(s)
 		- "no_dedicated_server"
 	- dedicated_servers: list - Available dedicated servers for user selection
 	"""
@@ -651,6 +943,9 @@ def get_dedicated_server_info(release_group_name: str) -> dict:
 		filters={"name": ("in", linked_servers), "status": "Active"},
 		fields=["name", "title", "public", "team", "cluster", "provider"],
 	)
+
+	servers = attach_warranty_info_to_dedicated_servers(servers)
+
 	public_servers = [s for s in servers if s.public]
 	team_private_servers = [s for s in servers if not s.public and s.team == current_team]
 
@@ -686,8 +981,87 @@ def get_dedicated_server_info(release_group_name: str) -> dict:
 	}
 
 
+def _get_team_dedicated_server_info(for_server: str | None = None):
+	team = get_current_team()
+
+	filters = {
+		"team": team,
+		"status": "Active",
+		**({"name": for_server} if for_server else {}),
+	}
+
+	servers = frappe.db.get_all(
+		"Server",
+		filters=filters,
+		fields=[
+			"name",
+			"title",
+			"cluster",
+			"provider",
+			"plan",
+			"public",
+		],
+	)
+
+	for server in servers:
+		# Combined app server + database server cost, matching the gate in
+		# `_is_plan_allowed_on_server` so the UI and backend agree.
+		server["price_usd"] = get_dedicated_server_price(server["name"])
+
+	if for_server:
+		servers = attach_warranty_info_to_dedicated_servers(servers)
+
+	if not servers:
+		if for_server:
+			frappe.throw(f"Server {for_server} not found")  # nosemgrep
+		return {
+			"case": "no_dedicated_server",
+			"dedicated_servers": [],
+		}
+
+	if len(servers) == 1:
+		return {
+			"case": "dedicated_only_single" if for_server else "user_choice_single",
+			"dedicated_servers": servers,
+		}
+
+	return {
+		"case": "user_choice_multiple",
+		"dedicated_servers": servers,
+	}
+
+
 @frappe.whitelist()
-def options_for_new(for_bench: str | None = None):  # noqa: C901
+def get_release_group_policies_for_site(version: str | None = None, for_bench: str | None = None):
+	"""Get mandatory apps from polices for a given version
+	If a bench is specified we can get the version from there otherwise we will use the version passed as argument
+	"""
+	from press.press.doctype.bench.bench import get_apps_in_bench
+
+	apps_in_bench = set()
+
+	if not version and not for_bench:
+		frappe.throw("Version or bench must be specified", frappe.ValidationError)
+
+	if not version and for_bench:
+		version = frappe.db.get_value("Release Group", for_bench, "version")
+
+	if for_bench:
+		apps_in_bench = set(get_apps_in_bench(for_bench))
+
+	assert version, "Version must be specified or derived from bench"
+
+	mandatory_apps = {
+		app["app"]
+		for app in get_app_from_policies(scope="Frappe Version", target=version, for_installation=True)
+	}
+	mandatory_apps = mandatory_apps.intersection(apps_in_bench)
+
+	return {"policies": list(mandatory_apps)}
+
+
+@frappe.whitelist()
+def options_for_new(for_bench: str | None = None, for_server: str | None = None):  # noqa: C901
 	from press.press.doctype.cloud_provider.cloud_provider import get_cloud_providers
 	from press.utils import get_nearest_cluster
 
@@ -726,7 +1100,14 @@ def options_for_new(for_bench: str | None = None):  # noqa: C901
 
 		marketplace_apps = frappe.db.get_all(
 			"Marketplace App",
-			fields=["title", "image", "description", "app", "route", "subscription_type"],
+			fields=[
+				"title",
+				"image",
+				"description",
+				"app",
+				"route",
+				"subscription_type",
+			],
 			filters={"app": ("in", unique_apps)},
 		)
 		total_installs_by_app = get_total_installs_by_app()
@@ -748,7 +1129,7 @@ def options_for_new(for_bench: str | None = None):  # noqa: C901
 	default_domain = frappe.db.get_single_value("Press Settings", "domain")
 	cluster_specific_root_domains = frappe.db.get_all(
 		"Root Domain",
-		{"name": ("like", f"%.{default_domain}")},
+		{"name": ("like", f"%.{default_domain}"), "enabled": 1},
 		["name", "default_cluster as cluster"],
 	)
 
@@ -785,6 +1166,7 @@ def options_for_new(for_bench: str | None = None):  # noqa: C901
 		"app_source_details": app_source_details_grouped,
 		"providers": list(unique_providers.values()),
 		"additional_clusters": private_bench_clusters,
+		"dedicated_server_config": (_get_team_dedicated_server_info(for_server) if not for_bench else []),
 	}
 
 
@@ -840,7 +1222,9 @@ def get_available_versions(for_bench: str | None = None):
 		if release_group:
 			version.group = release_group
 			if for_bench:
-				version.group.dedicated_server_config = get_dedicated_server_info(release_group.name) or {}
+				version.group.dedicated_server_config = (
+					_get_dedicated_server_info_for_release_group(release_group.name) or {}
+				)
 
 			set_bench_and_clusters(version, for_bench)
 
@@ -915,25 +1299,15 @@ def set_bench_and_clusters(version, for_bench):
 			)
 			allowed_cluster_names = list(set(public_servers_clusters))
 
-		clusters = frappe.db.get_all(
+		filters = {"name": ("in", allowed_cluster_names)}
+		if not for_bench:
+			filters["public"] = 1
+
+		version.group.clusters = frappe.db.get_all(
 			"Cluster",
-			filters={"name": ("in", allowed_cluster_names)},
+			filters=filters,
 			fields=["name", "title", "image", "beta", "cloud_provider"],
 		)
-		if not for_bench:
-			proxy_servers = frappe.db.get_all(
-				"Proxy Server",
-				{
-					"cluster": ("in", allowed_cluster_names),
-					"is_primary": 1,
-				},
-				["name", "cluster"],
-			)
-
-			for cluster in clusters:
-				cluster.proxy_server = find(proxy_servers, lambda x: x.cluster == cluster.name)
-
-		version.group.clusters = clusters
 
 
 def get_additional_clusters_for_private_benches(existing_clusters, cloud_providers, unique_providers):
@@ -949,9 +1323,11 @@ def get_additional_clusters_for_private_benches(existing_clusters, cloud_provide
 	if not private_bench_site_plans_providers:
 		return []
 
+	filters = {"parent": ("in", private_bench_site_plans_providers)}
+
 	allowed_providers = frappe.db.get_all(
 		"Cloud Providers",
-		filters={"parent": ("in", private_bench_site_plans_providers)},
+		filters=filters,
 		pluck="cloud_provider",
 	)
 
@@ -979,7 +1355,7 @@ def get_additional_clusters_for_private_benches(existing_clusters, cloud_provide
 
 		cluster_info = frappe.db.get_value(
 			"Cluster",
-			cluster_name,
+			{"name": cluster_name, "public": 1},
 			["name", "title", "image", "beta", "cloud_provider"],
 			as_dict=True,
 		)
@@ -1100,6 +1476,7 @@ def get_site_plans():
 		fields=[
 			"name",
 			"plan_title",
+			"plan_description",
 			"price_usd",
 			"price_inr",
 			"cpu_time_per_day",
@@ -1114,6 +1491,8 @@ def get_site_plans():
 			"is_trial_plan",
 			"allow_downgrading_from_other_plan",
 			"private_bench_support",
+			"restrict_based_on_dedicated_server_plan",
+			"minimum_server_price_usd",
 		],
 		# TODO: Remove later, temporary change because site plan has all document_type plans
 		filters={"document_type": "Site"},
@@ -1588,7 +1967,10 @@ def get_installed_apps(site, query_filters: dict | None = None):
 		)
 		app_source.update(app_tags if app_tags else {})
 		app_source.subscription_available = bool(
-			frappe.db.exists("Marketplace App Plan", {"price_usd": (">", 0), "app": app.app, "enabled": 1})
+			frappe.db.exists(
+				"Marketplace App Plan",
+				{"price_usd": (">", 0), "app": app.app, "enabled": 1},
+			)
 		)
 		app_source.billing_type = is_prepaid_marketplace_app(app.app)
 		if frappe.db.exists(
@@ -1830,8 +2212,11 @@ def clear_cache(name):
 @protected("Site")
 def restore(name, files, skip_failing_patches=False):
 	if not files.get("database") and not files.get("public") and not files.get("private"):
-		frappe.throw("At least one file must be provided for restoration.")
+		frappe.throw(
+			"At least one file must be provided for restoration. Please provide either of database, public or private file to begin restoration of the site {name}."
+		)
 
+	validate_files_belong_to_team(files, frappe.db.get_value("Site", name, "team"))
 	frappe.db.set_value(
 		"Site",
 		name,
@@ -1856,9 +2241,16 @@ def validate_restoration_space_requirements(
 	database_server: DatabaseServer = frappe.get_cached_doc("Database Server", server.database_server)
 
 	required_space_on_app_server = site.get_restore_space_required_on_app(
-		db_file_size=db_file_size, public_file_size=public_file_size, private_file_size=private_file_size
+		db_file_size=db_file_size,
+		public_file_size=public_file_size,
+		private_file_size=private_file_size,
 	)
-	required_space_on_db_server = site.get_restore_space_required_on_db(db_file_size=db_file_size)
+	required_space_on_db_server = site.db_server_restore_space(
+		server,
+		database_server,
+		site.get_restore_space_required_on_db(db_file_size=db_file_size),
+		required_space_on_app_server,
+	)
 
 	free_space_on_app_server = server.free_space(server.guess_data_disk_mountpoint())
 	free_space_on_db_server = database_server.free_space(database_server.guess_data_disk_mountpoint())
@@ -1867,9 +2259,9 @@ def validate_restoration_space_requirements(
 
 	if server.public:
 		"""
-		If it's a public server, Frappe Cloud will auto extend the disk space
-		to accommodate the restoration.
-		"""
+        If it's a public server, Frappe Cloud will auto extend the disk space
+        to accommodate the restoration.
+        """
 		allowed_to_upload = True
 	else:
 		if (
@@ -1880,10 +2272,10 @@ def validate_restoration_space_requirements(
 
 	return {
 		"allowed_to_upload": allowed_to_upload,
-		"free_space_on_app_server": free_space_on_app_server
-		if not server.public
-		else -1,  # -1 indicates unlimited space, no need to expose public server space
-		"free_space_on_db_server": free_space_on_db_server if not database_server.public else -1,
+		"free_space_on_app_server": (
+			free_space_on_app_server if not server.public else -1
+		),  # -1 indicates unlimited space, no need to expose public server space
+		"free_space_on_db_server": (free_space_on_db_server if not database_server.public else -1),
 		"is_insufficient_space_on_app_server": free_space_on_app_server < required_space_on_app_server,
 		"is_insufficient_space_on_db_server": free_space_on_db_server < required_space_on_db_server,
 		"required_space_on_app_server": required_space_on_app_server,
@@ -1908,6 +2300,11 @@ def setup_wizard_complete(name):
 @frappe.whitelist()
 @protected("Site")
 def check_dns(name, domain):
+	domain = domain.lower().strip(".")
+	if d := get_matching_domain(domain):
+		frappe.throw(
+			f"Cannot add {d} domain as it is a system reserved domain. Please use a different domain for your site."
+		)
 	return check_dns_cname_a(name, domain)
 
 
@@ -2008,7 +2405,7 @@ def update_config(name, config):
 		elif c.type == "Boolean":
 			c.value = bool(sbool(c.value))
 		elif c.type == "JSON":
-			c.value = frappe.parse_json(c.value)
+			c.value = parse_json_config_value(c.key, c.value)
 		elif c.type == "Password" and c.value == "*******":
 			c.value = frappe.get_value("Site Config", {"key": c.key, "parent": name}, "value")
 		sanitized_config.append(c)
@@ -2025,18 +2422,25 @@ def get_trial_plan():
 
 @frappe.whitelist()
 def get_upload_link(file, parts=1):
-	bucket_name = frappe.db.get_single_value("Press Settings", "remote_uploads_bucket")
-	expiration = frappe.db.get_single_value("Press Settings", "remote_link_expiry") or 3600
+	upload_bucket_details = frappe.db.get_values(
+		"Press Settings",
+		"Press Settings",
+		["remote_uploads_bucket", "region_name", "remote_access_key_id", "remote_link_expiry"],
+		as_dict=True,
+	)[0]
+
+	bucket_name = upload_bucket_details.remote_uploads_bucket
+	expiration = cint(upload_bucket_details.remote_link_expiry) or 3600
 	object_name = get_remote_key(file)
 	parts = int(parts)
 
 	s3_client = client(
 		"s3",
-		aws_access_key_id=frappe.db.get_single_value("Press Settings", "remote_access_key_id"),
+		aws_access_key_id=upload_bucket_details.remote_access_key_id,
 		aws_secret_access_key=get_decrypted_password(
 			"Press Settings", "Press Settings", "remote_secret_access_key"
 		),
-		region_name="ap-south-1",
+		region_name=upload_bucket_details.region_name or "ap-south-1",
 	)
 	try:
 		# The response contains the presigned URL and required fields
@@ -2116,7 +2520,7 @@ def get_backup_links(url, email, password):
 	try:
 		files = get_frappe_backups(url, email, password)
 	except requests.RequestException as e:
-		frappe.throw(f"Could not fetch backups from {url}. Error: {e}")
+		frappe.throw(f"Could not fetch backups from {url}. Error: {e}")  # nosemgrep
 	remote_files = []
 	for file_type, file_url in files.items():
 		file_name = file_url.split("backups/")[1].split("?sid=")[0]
@@ -2201,7 +2605,8 @@ def confirm_site_transfer(key: str):
 		team_change = frappe.get_doc("Team Change", team_change)
 		to_team = team_change.to_team
 		if not frappe.db.get_value(
-			"Team Member", {"user": frappe.session.user, "parent": to_team, "parenttype": "Team"}
+			"Team Member",
+			{"user": frappe.session.user, "parent": to_team, "parenttype": "Team"},
 		):
 			return frappe.respond_as_web_page(
 				_("Not Permitted"),
@@ -2236,17 +2641,17 @@ def add_server_to_release_group(name, group_name, server=None):
 
 	if not frappe.db.exists("Deploy Candidate Build", {"status": "Success", "group": group_name}):
 		frappe.throw(
-			f"There should be atleast one deploy in the bench {frappe.bold(rg.title)} to do a site migration or a site version upgrade."
+			f"There should be atleast one deploy in the bench {frappe.bold(rg.title)} to do a site migration or a site version upgrade. Please <a href='https://docs.frappe.io/cloud/handbook/how-bench-deploy-works'>create a deploy</a> to proceed further."
 		)
 	try:
 		deploy = rg.add_server(server, deploy=True)
 	except PermissionError as e:
 		if f"does not have access to this document: Release Group - {group_name}" in str(e):
 			frappe.throw(
-				f"Bench group is owned by a team you (<strong>{frappe.session.user}</strong>) are not a member of. Please contact the team owner or transfer the bench group to your team.",
+				f"Bench is owned by a team you (<strong>{frappe.session.user}</strong>) are not a member of. Please contact the team owner or transfer the bench to your team.",
 			)
 		else:
-			frappe.throw(str(e), type(e))
+			frappe.throw(str(e), type(e))  # nosemgrep
 
 	if isinstance(deploy, str):
 		return None
@@ -2266,143 +2671,6 @@ def validate_group_for_upgrade(name, group_name):
 
 @frappe.whitelist()
 @protected("Site")
-@role_guard.document(
-	document_type=lambda _: "Release Group",
-	inject_values=True,
-	should_throw=False,
-)
-def change_group_options(name, release_groups=None):
-	team = get_current_team()
-	group, server, plan = frappe.db.get_value("Site", name, ["group", "server", "plan"])
-
-	if plan and not frappe.db.get_value("Site Plan", plan, "private_benches"):
-		frappe.throw(
-			"The current plan doesn't allow the site to be in a private bench. Please upgrade to a higher plan to move your site."
-		)
-
-	version = frappe.db.get_value("Release Group", group, "version")
-
-	Bench = frappe.qb.DocType("Bench")
-	ReleaseGroup = frappe.qb.DocType("Release Group")
-	query = (
-		frappe.qb.from_(Bench)
-		.select(Bench.group.as_("name"), ReleaseGroup.title)
-		.inner_join(ReleaseGroup)
-		.on(ReleaseGroup.name == Bench.group)
-		.where(Bench.status == "Active")
-		.where(ReleaseGroup.name != group)
-		.where(ReleaseGroup.version == version)
-		.where(ReleaseGroup.team == team)
-		.where(Bench.server == server)
-		.groupby(Bench.group)
-	)
-
-	if release_groups and isinstance(release_groups, list):
-		query = query.where(ReleaseGroup.name.isin(release_groups))
-
-	return query.run(as_dict=True)
-
-
-@frappe.whitelist()
-@protected("Site")
-def clone_group(name: str, new_group_title: str, server: str | None = None):
-	site = frappe.get_doc("Site", name)
-	group = frappe.get_doc("Release Group", site.group)
-	cloned_group = frappe.new_doc("Release Group")
-
-	cloned_group.update(
-		{
-			"title": new_group_title,
-			"team": get_current_team(),
-			"public": 0,
-			"enabled": 1,
-			"version": group.version,
-			"dependencies": group.dependencies,
-			"is_redisearch_enabled": group.is_redisearch_enabled,
-			"servers": [{"server": server if server else site.server, "default": False}],
-		}
-	)
-
-	# add apps to rg if they are installed in site
-	apps_installed_in_site = [app.app for app in site.apps]
-	cloned_group.apps = [app for app in group.apps if app.app in apps_installed_in_site]
-
-	cloned_group.insert()
-
-	candidate = cloned_group.create_deploy_candidate()
-	candidate.schedule_build_and_deploy()
-
-	return {
-		"bench_name": cloned_group.name,
-		"candidate_name": candidate.name,
-	}
-
-
-@frappe.whitelist()
-@protected("Site")
-def change_group(name, group, skip_failing_patches=False):
-	team = frappe.db.get_value("Release Group", group, "team")
-	if team != get_current_team():
-		frappe.throw(f"Bench {group} does not belong to your team")
-
-	site = frappe.get_doc("Site", name)
-	site.move_to_group(group, skip_failing_patches=skip_failing_patches)
-
-
-@frappe.whitelist()
-@protected("Site")
-def change_region_options(name):
-	group, cluster = frappe.db.get_value("Site", name, ["group", "cluster"])
-
-	group = frappe.get_doc("Release Group", group)
-	cluster_names = group.get_clusters()
-	group_regions = frappe.get_all(
-		"Cluster", filters={"name": ("in", cluster_names)}, fields=["name", "title", "image"]
-	)
-
-	return {
-		"regions": [region for region in group_regions if region.name != cluster],
-		"current_region": cluster,
-	}
-
-
-@frappe.whitelist()
-@protected("Site")
-def change_region(name, cluster, scheduled_datetime=None, skip_failing_patches=False):
-	group = frappe.db.get_value("Site", name, "group")
-	bench_vals = frappe.db.get_value(
-		"Bench", {"group": group, "cluster": cluster, "status": "Active"}, ["name", "server"]
-	)
-
-	if bench_vals is None:
-		frappe.throw(f"Bench {group} does not have an existing deploy in {cluster}")
-
-	bench, server = bench_vals
-
-	site_migration = frappe.get_doc(
-		{
-			"doctype": "Site Migration",
-			"site": name,
-			"destination_group": group,
-			"destination_bench": bench,
-			"destination_server": server,
-			"destination_cluster": cluster,
-			"scheduled_time": scheduled_datetime,
-			"skip_failing_patches": skip_failing_patches,
-		}
-	).insert()
-
-	if not scheduled_datetime:
-		site_migration.start()
-
-
-@frappe.whitelist()
-@protected("Site")
-@role_guard.document(
-	document_type=lambda _: "Release Group",
-	inject_values=True,
-	should_throw=False,
-)
 def get_private_groups_for_upgrade(name, version, release_groups=None):
 	team = get_current_team()
 	version_number = frappe.db.get_value("Frappe Version", version, "number")
@@ -2431,8 +2699,12 @@ def get_private_groups_for_upgrade(name, version, release_groups=None):
 		.distinct()
 	)
 
-	if release_groups and isinstance(release_groups, list):
-		query = query.where(ReleaseGroup.name.isin(release_groups))
+	if role_guard.is_restricted():
+		release_groups = role_guard.permitted_documents("Release Group")
+		if not release_groups:
+			query = query.where(ValueWrapper(1) == 0)  # Hack!
+		else:
+			query = query.where(ReleaseGroup.name.isin(release_groups))
 
 	return query.run(as_dict=True)
 
@@ -2440,7 +2712,11 @@ def get_private_groups_for_upgrade(name, version, release_groups=None):
 @frappe.whitelist()
 @protected("Site")
 def version_upgrade(
-	name, destination_group, scheduled_datetime=None, skip_failing_patches=False, skip_backups=False
+	name,
+	destination_group,
+	scheduled_datetime=None,
+	skip_failing_patches=False,
+	skip_backups=False,
 ):
 	site = frappe.get_doc("Site", name)
 	current_version, shared_site, central_site = frappe.db.get_value(
@@ -2468,7 +2744,9 @@ def version_upgrade(
 		if destination_group:
 			destination_group = destination_group[0]
 		else:
-			frappe.throw(f"There are no public benches with the version {frappe.bold(next_version)}.")
+			frappe.throw(
+				f"There are no public benches with the version {frappe.bold(next_version)}. Please try with another public bench or reach out to us at<a href='https://support.frappe.io'> support.frappe.io </a>."
+			)  # nosemgrep
 
 	version_upgrade = frappe.get_doc(
 		{
@@ -2487,12 +2765,297 @@ def version_upgrade(
 
 @frappe.whitelist()
 @protected("Site")
+def check_existing_upgrade_bench(name, version):
+	"""
+	Check if an existing next-version bench exists on the same server
+	which includes all the apps installed on the site.
+
+	Returns: {
+		"exists": bool,
+		"bench_name": str or None,
+		"release_group": str or None,
+	}
+	"""
+	site_server = frappe.db.get_value("Site", name, "server")
+	current_team = get_current_team()
+	site_apps = set(frappe.db.get_all("Site App", filters={"parent": name}, pluck="app"))
+
+	version_number = frappe.db.get_value("Frappe Version", version, "number")
+	next_version = frappe.db.get_value(
+		"Frappe Version",
+		{
+			"number": version_number + 1,
+			"status": ("in", ("Stable", "End of Life")),
+			"public": True,
+		},
+		"name",
+	)
+
+	if not next_version:
+		return {"exists": False, "bench_name": None, "release_group": None}
+
+	# Find private benches on same server with next version
+	Bench = frappe.qb.DocType("Bench")
+	ReleaseGroup = frappe.qb.DocType("Release Group")
+
+	benches = (
+		frappe.qb.from_(Bench)
+		.join(ReleaseGroup)
+		.on(Bench.group == ReleaseGroup.name)
+		.select(Bench.name, Bench.group, ReleaseGroup.title)
+		.where(Bench.status == "Active")
+		.where(Bench.server == site_server)
+		.where(Bench.team == current_team)
+		.where(ReleaseGroup.version == next_version)
+	).run(as_dict=True)
+
+	if not benches:
+		return {
+			"exists": False,
+			"bench_name": None,
+			"release_group": None,
+			"release_group_title": None,
+		}
+
+	bench_groups = [bench.group for bench in benches]
+	all_bench_apps = frappe.db.get_all(
+		"Release Group App",
+		filters={"parent": ("in", bench_groups)},
+		fields=["parent", "app"],
+	)
+	bench_apps_map = {}
+	for row in all_bench_apps:
+		if row.parent not in bench_apps_map:
+			bench_apps_map[row.parent] = []
+		bench_apps_map[row.parent].append(row.app)
+
+	for bench in benches:
+		bench_app_list = bench_apps_map.get(bench.group, [])
+		if site_apps.issubset(bench_app_list):
+			return {
+				"exists": True,
+				"bench_name": bench.name,
+				"release_group": bench.group,
+				"release_group_title": bench.title,
+			}
+
+	return {
+		"exists": False,
+		"bench_name": None,
+		"release_group": None,
+		"release_group_title": None,
+	}
+
+
+@frappe.whitelist()
+@protected("Site")
+def check_app_compatibility_for_upgrade(name, version):
+	"""
+	Check which apps in the current site are compatible with the next Frappe version.
+	Returns list of custom apps installed on the site, if any and other custom apps in the release group for selecting a compatible branch.
+	"""
+	next_version = get_next_version(version)
+	site_group = frappe.db.get_value("Site", name, "group")
+
+	site_app_names = frappe.db.get_all("Site App", filters={"parent": name}, pluck="app")
+	release_group_apps = frappe.db.get_all(
+		"Release Group App",
+		filters={"parent": site_group},
+		fields=["app", "source"],
+	)
+
+	source_names = list({a.source for a in release_group_apps})
+	app_sources = frappe.db.get_all(
+		"App Source",
+		filters={"name": ("in", source_names)},
+		fields=[
+			"name",
+			"app_title",
+			"app",
+			"public",
+			"enabled",
+			"repository",
+			"repository_url",
+			"repository_owner",
+			"github_installation_id",
+			"branch",
+		],
+	)
+	source_map = {s.app: s for s in app_sources}
+	public_apps = []
+	public_source_map = {}
+	for app in site_app_names:
+		source = source_map.get(app)
+		if not source or not source.enabled:
+			frappe.throw(f"Could not find a valid source for app {app}.")  # nosemgrep
+		# Treat frappe-owned apps as public apps requiring compatibility checks
+		if source.public or source.repository_owner == "frappe":
+			public_apps.append(app)
+			public_source_map[app] = source
+
+	incompatible_apps = _check_public_apps_compatibility(
+		public_apps,
+		public_source_map,
+		next_version,
+	)
+	if incompatible_apps:
+		return {
+			"incompatible": incompatible_apps,
+			"site_custom_apps": [],
+			"other_custom_apps_on_rg": [],
+			"can_upgrade": False,
+		}
+
+	site_custom_apps = []
+	other_custom_apps_on_rg = []  # Custom apps in the release group which aren't installed on the site
+	for row in release_group_apps:
+		source = source_map.get(row.app)
+		if not source or source.public or source.repository_owner == "frappe" or not source.enabled:
+			continue
+
+		app_data = {
+			"app": row.app,
+			"source": source.name,
+			"title": source.app_title or row.app,
+			"repository": source.repository,
+			"repository_url": source.repository_url,
+			"repository_owner": source.repository_owner,
+			"branch": source.branch,
+		}
+
+		if row.app in site_app_names:
+			site_custom_apps.append(app_data)
+		else:
+			other_custom_apps_on_rg.append(app_data)
+
+	return {
+		"incompatible": [],
+		"site_custom_apps": site_custom_apps,
+		"other_custom_apps_on_rg": other_custom_apps_on_rg,
+		"can_upgrade": True,
+	}
+
+
+@frappe.whitelist()
+@protected("Site")
+def create_private_bench_for_site_upgrade(
+	name,
+	version,
+	release_group_title,
+	custom_app_sources=None,
+	scheduled_time=None,
+	skip_failing_patches=False,
+	skip_backups=False,
+):
+	"""
+	Deploy private release group and schedule version upgrade.
+	"""
+	from press.press.doctype.release_group.release_group import new_release_group
+
+	next_version = get_next_version(version)
+	site_group, site_server = frappe.db.get_value("Site", name, ["group", "server"])
+	team = get_current_team()
+	custom_app_sources = custom_app_sources or []
+	custom_source_map = {c.get("app"): c for c in custom_app_sources}
+
+	current_rg_apps = frappe.db.get_all(
+		"Release Group App",
+		filters={"parent": site_group},
+		fields=["app", "source"],
+	)
+	current_site_apps = frappe.db.get_all(
+		"Site App",
+		filters={"parent": name},
+		pluck="app",
+	)
+
+	if not current_rg_apps:
+		frappe.throw(
+			"No apps found in current bench group. Please <a class='underline' href='https://docs.frappe.io/cloud/installing-an-app#bench-group'> add apps </a> to the bench group."
+		)
+
+	app_names = [a.app for a in current_rg_apps]
+	source_names = [a.source for a in current_rg_apps]
+
+	app_sources = frappe.db.get_all(
+		"App Source",
+		filters={"name": ("in", source_names)},
+		fields=[
+			"name",
+			"repository_owner",
+			"app",
+			"public",
+			"enabled",
+			"repository",
+			"repository_url",
+			"github_installation_id",
+		],
+	)
+
+	source_map = {s.name: s for s in app_sources}
+	_, compatible_apps_map = get_compatible_public_apps_and_sources(
+		app_names,
+		next_version,
+	)
+
+	apps_for_new_group = _get_apps_for_version_upgrade(
+		current_site_apps,
+		current_rg_apps,
+		source_map,
+		compatible_apps_map,
+		custom_source_map,
+		next_version,
+		team,
+	)
+	apps_payload = [{"app": app, "source": source} for app, source in apps_for_new_group]
+
+	# Validate all site apps are covered before creating bench
+	new_bench_app_names = {a["app"] for a in apps_payload}
+	missing_site_apps = set(current_site_apps) - new_bench_app_names
+	if missing_site_apps:
+		frappe.throw(
+			f"Cannot upgrade site: the following apps are installed on {name} but no compatible source for {next_version} could be resolved — "
+			f"{', '.join(sorted(missing_site_apps))}"
+		)  # nosemgrep
+
+	try:
+		release_group_doc = new_release_group(
+			title=release_group_title,
+			version=next_version,
+			apps=apps_payload,
+			team=team,
+			server=site_server,
+		)
+		version_upgrade = frappe.get_doc(
+			{
+				"doctype": "Version Upgrade",
+				"site": name,
+				"deploy_private_bench": 1,
+				"destination_group": release_group_doc.name,
+				"scheduled_time": scheduled_time,
+				"skip_failing_patches": skip_failing_patches,
+				"skip_backups": skip_backups,
+				"status": "Pending",
+			}
+		)
+		version_upgrade.insert()
+		return release_group_doc.name
+	except Exception as e:
+		frappe.throw(f"Failed to create and deploy bench: {e!s}")  # nosemgrep
+
+
+@frappe.whitelist()
+@protected("Site")
 def change_server_options(name):
 	site = Site("Site", name)
 	return {
 		"servers": frappe.db.get_all(
 			"Server",
-			{"team": get_current_team(), "status": "Active", "name": ("!=", site.server)},
+			{
+				"team": get_current_team(),
+				"status": "Active",
+				"name": ("!=", site.server),
+			},
 			["name", "title"],
 		),
 		"estimated_duration": site.get_estimated_duration_for_server_change(),

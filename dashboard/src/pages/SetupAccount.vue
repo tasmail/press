@@ -74,19 +74,27 @@
 							/>
 							<FormControl
 								type="select"
-								:options="countries"
+								:options="countryOptions"
 								v-if="!isInvitation"
 								label="Country"
 								v-model="country"
 								variant="outline"
 								required
 							/>
+							<PhoneInput
+								v-if="!isInvitation"
+								label="Phone"
+								v-model="phoneNumber"
+								:countries="countries"
+								:country="country"
+								placeholder="9876543210"
+							/>
 						</div>
 						<ErrorMessage
 							class="mt-4"
 							:message="$resources.setupAccount.error"
 						/>
-						<div v-if="showLeadsConsentCheckbox" class="mt-4 text-gray-600">
+						<div v-if="showLeadsConsentCheckbox" class="mt-4 text-ink-gray-6">
 							<input
 								id="share-details-consent"
 								type="checkbox"
@@ -100,6 +108,10 @@
 								>Allow my details to be shared with a local partner</label
 							>
 						</div>
+						<ErrorMessage
+							class="mt-4"
+							:message="$resources.acceptInvite.error"
+						/>
 						<Button
 							class="mt-4"
 							variant="solid"
@@ -116,11 +128,11 @@
 					</template>
 				</form>
 				<div class="mt-4" v-if="!is2FA && !isInvitation">
-					<span class="text-base font-normal text-gray-600">
+					<span class="text-base font-normal text-ink-gray-6">
 						{{ 'By signing up, you agree to our ' }}
 					</span>
 					<a
-						class="text-base font-normal text-gray-900 underline hover:text-gray-700"
+						class="text-base font-normal text-ink-gray-9 underline hover:text-ink-gray-7"
 						href="https://frappecloud.com/policies"
 					>
 						Terms & Policies
@@ -144,6 +156,7 @@
 import LoginBox from '../components/auth/LoginBox.vue';
 import Link from '@/components/Link.vue';
 import Form from '@/components/Form.vue';
+import PhoneInput from '@/components/PhoneInput.vue';
 
 const detailsSharedProducts = [
 	'erpnext',
@@ -161,6 +174,7 @@ export default {
 		LoginBox,
 		Link,
 		Form,
+		PhoneInput,
 	},
 	props: ['requestKey', 'joinRequest'],
 	data() {
@@ -183,6 +197,7 @@ export default {
 			signupValues: {},
 			detailsSharedProducts,
 			shareDetailsConsent: false,
+			phoneNumber: '',
 		};
 	},
 	resources: {
@@ -223,6 +238,7 @@ export default {
 					first_name: this.firstName,
 					last_name: this.lastName,
 					country: this.country,
+					phone: this.phoneNumber || null,
 					is_invitation: this.isInvitation,
 					user_exists: this.userExists,
 					invited_by_parent_team: this.invitedByParentTeam,
@@ -281,6 +297,9 @@ export default {
 				this.saasProduct &&
 				this.detailsSharedProducts.includes(this.saasProduct.name.toLowerCase())
 			);
+		},
+		countryOptions() {
+			return this.countries.map((c) => c.name);
 		},
 	},
 	methods: {

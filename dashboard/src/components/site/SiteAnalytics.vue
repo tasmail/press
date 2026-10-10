@@ -1,83 +1,80 @@
 <template>
-	<div class="space-y-4 p-5">
-		<div
-			class="flex flex-col justify-end sticky top-5 z-10 p-3 bg-white border justify-self-center rounded-md space-y-2"
-		>
-			<div class="flex space-x-4">
-				<!-- Group all content items so spacing is consistent -->
-				<div class="flex space-x-4">
-					<!-- Start date group -->
-					<div class="flex space-x-2">
-						<label class="text-base text-gray-600 self-center">
-							Absolute <span class="text-black">from</span>
-						</label>
-						<DateTimePicker
-							:modelValue="inputStartDate"
-							variant="subtle"
-							label="Start date"
-							:disabled="false"
-							:formatter="dateFormatter"
-							@update:modelValue="updateStartDate"
-						/>
-					</div>
+	<div
+		class="flex flex-col justify-end items-center sticky top-0 z-20 p-2 md:p-3 w-full bg-surface-white border-b justify-self-center space-y-2"
+	>
+		<!-- Group all content items so spacing is consistent -->
+		<div class="flex gap-2 w-full overflow-auto">
+			<!-- Start date group -->
+			<label class="text-base text-ink-gray-6 self-center whitespace-nowrap">
+				Absolute <span class="pl-1 text-ink-gray-9">from</span>
+			</label>
+			<DateTimePicker
+				:modelValue="inputStartDate"
+				variant="subtle"
+				label="Start date"
+				:disabled="false"
+				format="D MMM YYYY, hh:mm a"
+				class="min-w-fit"
+				@update:modelValue="updateStartDate"
+			/>
 
-					<!-- End date group -->
-					<div class="flex space-x-2">
-						<label class="text-base self-center">to</label>
-						<DateTimePicker
-							:modelValue="inputEndDate"
-							variant="subtle"
-							label="End date"
-							:disabled="false"
-							:formatter="dateFormatter"
-							@update:modelValue="updateEndDate"
-						/>
-					</div>
+			<!-- End date group -->
+			<label class="text-base self-center">to</label>
+			<DateTimePicker
+				:modelValue="inputEndDate"
+				variant="subtle"
+				label="End date"
+				:disabled="false"
+				format="D MMM YYYY, hh:mm a"
+				class="min-w-fit"
+				@update:modelValue="updateEndDate"
+			/>
 
-					<!-- Divider -->
-					<div class="w-px bg-gray-200" />
+			<!-- Duration group -->
+			<label
+				class="text-base self-center text-ink-gray-6 border-l ml-1 pl-3 py-1"
+				>Relative</label
+			>
+			<FormControl
+				type="select"
+				class="w-36"
+				:options="durationOptions"
+				v-model="duration"
+			/>
 
-					<!-- Duration group -->
-					<div class="flex space-x-2">
-						<label class="text-base self-center text-gray-600">Relative</label>
-						<FormControl
-							type="select"
-							class="w-32"
-							:options="durationOptions"
-							v-model="duration"
-						/>
-					</div>
+			<!-- Grow -->
+			<div class="flex-grow" />
 
-					<!-- Divider -->
-					<div class="w-px bg-gray-200" />
-
-					<Tooltip text="Copy a shareable link to this Dashboard">
-						<!-- Share button -->
-						<ActionButton
-							variant="subtle"
-							label="Share"
-							class="text-gray-300 hover:text-black duration-200"
-							@click="(e) => shareDashboard(e, `global`)"
-							:slots="{
-								prefix: shareDashboardActionPrefix,
-							}"
-						/>
-					</Tooltip>
-				</div>
-			</div>
-
-			<div v-if="!!dateRangeError" class="text-red-500 text-sm">
-				{{ dateRangeError }}
-			</div>
+			<Tooltip text="Copy a shareable link to this Dashboard">
+				<!-- Share button -->
+				<ActionButton
+					variant="subtle"
+					label="Share"
+					class="text-ink-gray-3 hover:text-ink-gray-8 duration-200"
+					@click="(e) => shareDashboard(e, `global`)"
+					:slots="{
+						prefix: shareDashboardActionPrefix,
+					}"
+				/>
+			</Tooltip>
 		</div>
+
+		<div v-if="!!dateRangeError" class="text-red-500 text-sm">
+			{{ dateRangeError }}
+		</div>
+	</div>
+
+	<div class="space-y-4 p-5">
 		<ErrorMessage
-			:message="
-				$resources.analytics.error || $resources.advancedAnalytics.error
-			"
+			:message="$resources.analytics.error || advancedAnalyticsError"
 		/>
 
 		<div class="grid grid-cols-1 gap-5 sm:grid-cols-2">
-			<AnalyticsCard title="Daily Usage" @share-card="shareDashboard">
+			<AnalyticsCard
+				docs="https://docs.frappe.io/cloud/daily-usage-limit-reached"
+				title="Daily Usage"
+				@share-card="shareDashboard"
+			>
 				<LineChart
 					type="time"
 					title="Usage Counter"
@@ -88,18 +85,26 @@
 					:loading="$resources.analytics.loading"
 					:showCard="false"
 					class="h-[15.55rem] p-2 pb-3"
+					@datazoom="handleDataZoom"
 				/>
 			</AnalyticsCard>
 
 			<AnalyticsCard title="Uptime" @share-card="shareDashboard">
 				<SiteUptime
+					:site="name"
+					:timegrain="$resources.analytics?.data?.timegrain"
 					:data="$resources.analytics?.data?.uptime"
 					:loading="$resources.analytics.loading"
+					@datazoom="handleDataZoom"
 					class="h-[15.55rem] p-2 pb-3"
 				/>
 			</AnalyticsCard>
 
-			<AnalyticsCard title="Requests" @share-card="shareDashboard">
+			<AnalyticsCard
+				docs="https://docs.frappe.io/cloud/sites/monitoring#site-analytics"
+				title="Requests"
+				@share-card="shareDashboard"
+			>
 				<LineChart
 					type="time"
 					title="Requests"
@@ -110,18 +115,24 @@
 					:loading="$resources.analytics.loading"
 					:showCard="false"
 					class="h-[15.55rem] p-2 pb-3"
+					@datazoom="handleDataZoom"
 				/>
 				<template #action>
 					<router-link
-						class="text-base text-gray-600 hover:text-gray-700"
+						class="text-sm text-ink-gray-7 hover:text-ink-gray-7 flex items-center gap-1"
 						:to="{ name: 'Site Performance Request Logs' }"
 					>
-						Request Log Report →
+						Log Report
+						<LucideChevronRight class="size-4" />
 					</router-link>
 				</template>
 			</AnalyticsCard>
 
-			<AnalyticsCard title="Requests CPU Usage" @share-card="shareDashboard">
+			<AnalyticsCard
+				docs="https://docs.frappe.io/cloud/sites/monitoring#site-analytics"
+				title="Requests CPU Usage"
+				@share-card="shareDashboard"
+			>
 				<LineChart
 					type="time"
 					title="Requests CPU Usage"
@@ -132,6 +143,7 @@
 					:loading="$resources.analytics.loading"
 					:showCard="false"
 					class="h-[15.55rem] p-2 pb-3"
+					@datazoom="handleDataZoom"
 				/>
 			</AnalyticsCard>
 		</div>
@@ -142,7 +154,7 @@
 		>
 			<h2 class="text-lg font-semibold">Advanced Analytics</h2>
 			<FeatherIcon
-				class="h-5 w-5 text-gray-500 hover:text-gray-700"
+				class="h-5 w-5 text-ink-gray-5 hover:text-ink-gray-7"
 				:name="showAdvancedAnalytics ? 'chevron-down' : 'chevron-right'"
 			/>
 		</div>
@@ -152,7 +164,11 @@
 			v-if="showAdvancedAnalytics"
 			class="grid grid-cols-1 gap-5 sm:grid-cols-2"
 		>
-			<AnalyticsCard title="Background Jobs" @share-card="shareDashboard">
+			<AnalyticsCard
+				docs="https://docs.frappe.io/cloud/sites/monitoring#site-analytics"
+				title="Background Jobs"
+				@share-card="shareDashboard"
+			>
 				<LineChart
 					type="time"
 					title="Background Jobs"
@@ -160,13 +176,15 @@
 					:data="jobCountData"
 					unit="jobs"
 					:chartTheme="[$theme.colors.red[500]]"
-					:loading="$resources.advancedAnalytics.loading"
+					:loading="$resources.backgroundJobUsage.loading"
 					:showCard="false"
 					class="h-[15.55rem] p-2 pb-3"
+					@datazoom="handleDataZoom"
 				/>
 			</AnalyticsCard>
 
 			<AnalyticsCard
+				docs="https://docs.frappe.io/cloud/sites/monitoring#site-analytics"
 				title="Background Jobs CPU Usage"
 				@share-card="shareDashboard"
 			>
@@ -177,13 +195,15 @@
 					:data="jobTimeData"
 					unit="seconds"
 					:chartTheme="[$theme.colors.blue[500]]"
-					:loading="$resources.advancedAnalytics.loading"
+					:loading="$resources.backgroundJobUsage.loading"
 					:showCard="false"
 					class="h-[15.55rem] p-2 pb-3"
+					@datazoom="handleDataZoom"
 				/>
 			</AnalyticsCard>
 
 			<AnalyticsCard
+				docs="https://docs.frappe.io/cloud/sites/monitoring#investigating-high-usage"
 				class="sm:col-span-2"
 				title="Frequent Requests"
 				@share-card="shareDashboard"
@@ -194,7 +214,7 @@
 					:data="requestCountByPathData"
 					unit="requests"
 					:chartTheme="requestChartColors"
-					:loading="$resources.advancedAnalytics.loading"
+					:loading="$resources.requestCountByPath.loading"
 					:showCard="false"
 					class="h-[15.55rem] p-2 pb-3"
 					@datazoom="handleDataZoom"
@@ -202,6 +222,7 @@
 			</AnalyticsCard>
 
 			<AnalyticsCard
+				docs="https://docs.frappe.io/cloud/site/common-issues/site-slow-504-gateway-timeout#what-does-other-mean-in-chart"
 				class="sm:col-span-2"
 				title="Slowest Requests"
 				@share-card="shareDashboard"
@@ -211,7 +232,7 @@
 					:data="requestDurationByPathData"
 					unit="seconds"
 					:chartTheme="requestChartColors"
-					:loading="$resources.advancedAnalytics.loading"
+					:loading="$resources.requestDurationByPath.loading"
 					:showCard="false"
 					class="h-[15.55rem] p-2 pb-3"
 					@datazoom="handleDataZoom"
@@ -219,6 +240,7 @@
 			</AnalyticsCard>
 
 			<AnalyticsCard
+				docs="https://docs.frappe.io/cloud/site/common-issues/site-slow-504-gateway-timeout#slow-reports"
 				class="sm:col-span-2"
 				title="Query Report Durations"
 				v-if="queryReportRunReportsData"
@@ -226,7 +248,7 @@
 			>
 				<template #action>
 					<Tooltip text="Shown only as reports seem to take time">
-						<lucide-info class="ml-2 mr-auto h-3.5 w-3.5 text-gray-500" />
+						<lucide-info class="ml-2 mr-auto h-3.5 w-3.5 text-ink-gray-5" />
 					</Tooltip>
 				</template>
 				<BarChart
@@ -234,7 +256,7 @@
 					:data="queryReportRunReportsData"
 					unit="seconds"
 					:chartTheme="requestChartColors"
-					:loading="$resources.advancedAnalytics.loading"
+					:loading="$resources.requestDurationByPath.loading"
 					:showCard="false"
 					class="h-[15.55rem] p-2 pb-3"
 					@datazoom="handleDataZoom"
@@ -242,6 +264,7 @@
 			</AnalyticsCard>
 
 			<AnalyticsCard
+				docs="https://docs.frappe.io/cloud/site/common-issues/site-slow-504-gateway-timeout"
 				class="sm:col-span-2"
 				title="Run Doc Method Durations"
 				v-if="runDocMethodMethodnamesData"
@@ -249,7 +272,7 @@
 			>
 				<template #action>
 					<Tooltip text="Shown only as run_doc_method calls seem to take time">
-						<lucide-info class="ml-2 mr-auto h-3.5 w-3.5 text-gray-500" />
+						<lucide-info class="ml-2 mr-auto h-3.5 w-3.5 text-ink-gray-5" />
 					</Tooltip>
 				</template>
 				<BarChart
@@ -257,7 +280,7 @@
 					:data="runDocMethodMethodnamesData"
 					unit="seconds"
 					:chartTheme="requestChartColors"
-					:loading="$resources.advancedAnalytics.loading"
+					:loading="$resources.requestDurationByPath.loading"
 					:showCard="false"
 					class="h-[15.55rem] p-2 pb-3"
 					@datazoom="handleDataZoom"
@@ -265,13 +288,14 @@
 			</AnalyticsCard>
 
 			<AnalyticsCard
+				docs="https://docs.frappe.io/cloud/site/common-issues/site-slow-504-gateway-timeout"
 				class="sm:col-span-2"
 				title="Save Docs Doctype Durations"
 				v-if="saveDocsDoctypesData"
 			>
 				<template #action>
 					<Tooltip text="Shown only as savedocs calls seem to take time">
-						<lucide-info class="ml-2 mr-auto h-3.5 w-3.5 text-gray-500" />
+						<lucide-info class="ml-2 mr-auto h-3.5 w-3.5 text-ink-gray-5" />
 					</Tooltip>
 				</template>
 				<BarChart
@@ -279,20 +303,21 @@
 					:data="saveDocsDoctypesData"
 					unit="seconds"
 					:chartTheme="requestChartColors"
-					:loading="$resources.advancedAnalytics.loading"
+					:loading="$resources.requestDurationByPath.loading"
 					:showCard="false"
 					class="h-[15.55rem] p-2 pb-3"
 				/>
 			</AnalyticsCard>
 
 			<AnalyticsCard
+				docs="https://docs.frappe.io/cloud/site/common-issues/site-slow-504-gateway-timeout"
 				class="sm:col-span-2"
 				title="Save Docs Action Durations"
 				v-if="saveDocsActionData"
 			>
 				<template #action>
 					<Tooltip text="Shown only as savedocs calls seem to take time">
-						<lucide-info class="ml-2 mr-auto h-3.5 w-3.5 text-gray-500" />
+						<lucide-info class="ml-2 mr-auto h-3.5 w-3.5 text-ink-gray-5" />
 					</Tooltip>
 				</template>
 				<BarChart
@@ -300,13 +325,14 @@
 					:data="saveDocsActionData"
 					unit="seconds"
 					:chartTheme="requestChartColors"
-					:loading="$resources.advancedAnalytics.loading"
+					:loading="$resources.requestDurationByPath.loading"
 					:showCard="false"
 					class="h-[15.55rem] p-2 pb-3"
 				/>
 			</AnalyticsCard>
 
 			<AnalyticsCard
+				docs="https://docs.frappe.io/cloud/site/common-issues/site-slow-504-gateway-timeout"
 				class="sm:col-span-2"
 				title="Individual Request Time (Average)"
 				@share-card="shareDashboard"
@@ -316,13 +342,14 @@
 					:data="averageRequestDurationByPathData"
 					unit="seconds"
 					:chartTheme="requestChartColors"
-					:loading="$resources.advancedAnalytics.loading"
+					:loading="$resources.averageRequestDurationByPath.loading"
 					:showCard="false"
 					class="h-[15.55rem] p-2 pb-3"
 					@datazoom="handleDataZoom"
 				/>
 			</AnalyticsCard>
 			<AnalyticsCard
+				docs="https://docs.frappe.io/cloud/sites/monitoring#investigating-high-usage"
 				class="sm:col-span-2"
 				title="Requests by IP"
 				@share-card="shareDashboard"
@@ -332,7 +359,7 @@
 					:data="requestCountByIPData"
 					unit="requests"
 					:chartTheme="requestChartColors"
-					:loading="$resources.advancedAnalytics.loading"
+					:loading="$resources.requestCountByIp.loading"
 					:showCard="false"
 					class="h-[15.55rem] p-2 pb-3"
 					@datazoom="handleDataZoom"
@@ -340,6 +367,7 @@
 			</AnalyticsCard>
 
 			<AnalyticsCard
+				docs="https://docs.frappe.io/cloud/sites/monitoring#investigating-high-usage"
 				class="sm:col-span-2"
 				title="Frequent Background Jobs"
 				@share-card="shareDashboard"
@@ -349,7 +377,7 @@
 					:data="backgroundJobCountByMethodData"
 					unit="jobs"
 					:chartTheme="requestChartColors"
-					:loading="$resources.advancedAnalytics.loading"
+					:loading="$resources.backgroundJobCountByMethod.loading"
 					:showCard="false"
 					class="h-[15.55rem] p-2 pb-3"
 					@datazoom="handleDataZoom"
@@ -357,6 +385,7 @@
 			</AnalyticsCard>
 
 			<AnalyticsCard
+				docs="https://docs.frappe.io/cloud/sites/monitoring#investigating-high-usage"
 				class="sm:col-span-2"
 				title="Slowest Background Jobs"
 				@share-card="shareDashboard"
@@ -366,7 +395,7 @@
 					:data="backgroundJobDurationByMethodData"
 					unit="seconds"
 					:chartTheme="requestChartColors"
-					:loading="$resources.advancedAnalytics.loading"
+					:loading="$resources.backgroundJobDurationByMethod.loading"
 					:showCard="false"
 					class="h-[15.55rem] p-2 pb-3"
 					@datazoom="handleDataZoom"
@@ -374,6 +403,7 @@
 			</AnalyticsCard>
 
 			<AnalyticsCard
+				docs="https://docs.frappe.io/cloud/site/common-issues/site-slow-504-gateway-timeout#slow-reports"
 				class="sm:col-span-2"
 				title="Background Report Durations"
 				v-if="generateReportReportsData"
@@ -381,7 +411,7 @@
 			>
 				<template #action>
 					<Tooltip text="Shown only as reports seem to take time">
-						<lucide-info class="ml-2 mr-auto h-3.5 w-3.5 text-gray-500" />
+						<lucide-info class="ml-2 mr-auto h-3.5 w-3.5 text-ink-gray-5" />
 					</Tooltip>
 				</template>
 				<BarChart
@@ -389,7 +419,7 @@
 					:data="generateReportReportsData"
 					unit="seconds"
 					:chartTheme="requestChartColors"
-					:loading="$resources.advancedAnalytics.loading"
+					:loading="$resources.backgroundJobDurationByMethod.loading"
 					:showCard="false"
 					class="h-[15.55rem] p-2 pb-3"
 					@datazoom="handleDataZoom"
@@ -397,6 +427,7 @@
 			</AnalyticsCard>
 
 			<AnalyticsCard
+				docs="https://docs.frappe.io/cloud/sites/monitoring#investigating-high-usage"
 				class="sm:col-span-2"
 				title="Individual Background Job Time (Average)"
 				@share-card="shareDashboard"
@@ -406,7 +437,7 @@
 					:data="averageBackgroundJobDurationByMethodData"
 					unit="seconds"
 					:chartTheme="requestChartColors"
-					:loading="$resources.advancedAnalytics.loading"
+					:loading="$resources.averageBackgroundJobDurationByMethod.loading"
 					:showCard="false"
 					class="h-[15.55rem] p-2 pb-3"
 					@datazoom="handleDataZoom"
@@ -414,20 +445,22 @@
 			</AnalyticsCard>
 
 			<AnalyticsCard
-				class="sm:col-span-2"
+				docs="https://docs.frappe.io/cloud/faq/mariadb-slow-queries-in-your-site"
+				class="sm:col-span-2 [&_[aria-label='Copy']]:m-0"
 				title="Frequent Slow Queries"
 				@share-card="shareDashboard"
 			>
 				<template #action>
 					<Tooltip text="Show Detailed Reports">
 						<router-link
-							class="mr-auto text-base text-gray-600 hover:text-gray-700"
+							class="text-base text-ink-gray-6 hover:text-ink-gray-7"
 							:to="{ name: 'Site Performance Slow Queries' }"
 						>
 							→
 						</router-link>
 					</Tooltip>
 					<TabButtons
+						class="ml-auto"
 						:buttons="[{ label: 'Denormalized' }, { label: 'Normalized' }]"
 						v-model="slowLogsFrequencyType"
 					/>
@@ -445,20 +478,22 @@
 			</AnalyticsCard>
 
 			<AnalyticsCard
-				class="sm:col-span-2"
+				docs="https://docs.frappe.io/cloud/faq/mariadb-slow-queries-in-your-site"
+				class="sm:col-span-2 [&_[aria-label='Copy']]:m-0"
 				title="Top Slow Queries"
 				@share-card="shareDashboard"
 			>
 				<template #action>
 					<Tooltip text="Show Detailed Reports">
 						<router-link
-							class="mr-auto text-base text-gray-600 hover:text-gray-700"
+							class="text-base text-ink-gray-6 hover:text-ink-gray-7"
 							:to="{ name: 'Site Performance Slow Queries' }"
 						>
 							→
 						</router-link>
 					</Tooltip>
 					<TabButtons
+						class="ml-auto"
 						:buttons="[{ label: 'Denormalized' }, { label: 'Normalized' }]"
 						v-model="slowLogsDurationType"
 					/>
@@ -479,17 +514,16 @@
 </template>
 
 <script>
-import { TabButtons, DateTimePicker, Button, Tooltip } from 'frappe-ui';
-import { toast } from 'vue-sonner';
-import dayjs from '../../utils/dayjs';
-import LineChart from '@/components/charts/LineChart.vue';
-import BarChart from '@/components/charts/BarChart.vue';
-import SiteUptime from './SiteUptime.vue';
-import AlertBanner from '../AlertBanner.vue';
-import AnalyticsCard from './AnalyticsCard.vue';
-import ShareIcon from '../icons/ShareIcon.vue';
-import ActionButton from '../ActionButton.vue';
-import { h } from 'vue';
+import { Button, DateTimePicker, TabButtons, Tooltip } from 'frappe-ui'
+import { h } from 'vue'
+import { toast } from 'vue-sonner'
+import BarChart from '@/components/charts/BarChart.vue'
+import LineChart from '@/components/charts/LineChart.vue'
+import dayjs, { dayjsFloorToMinutes } from '../../utils/dayjs'
+import ActionButton from '../ActionButton.vue'
+import AlertBanner from '../AlertBanner.vue'
+import AnalyticsCard from './AnalyticsCard.vue'
+import SiteUptime from './SiteUptime.vue'
 
 export default {
 	name: 'SiteAnalytics',
@@ -511,15 +545,15 @@ export default {
 			highlightedCardId: null,
 			now: dayjs(),
 			defaultDuration: '1h',
-			allowTimestampSyncToUrl: false,
+			allowTimestampSyncToUrl: true,
 			inputStartDate: null,
 			logicalStartDate: null,
 			inputEndDate: null,
 			logicalEndDate: null,
 			showAdvancedAnalytics: true,
 			localTimezone: dayjs.tz.guess(),
-			slowLogsDurationType: 'Denormalized',
-			slowLogsFrequencyType: 'Denormalized',
+			slowLogsDurationType: 'Normalized',
+			slowLogsFrequencyType: 'Normalized',
 			allowDrillDown: false,
 			durationOptions: [
 				{ label: 'Duration', value: null, disabled: true },
@@ -531,23 +565,23 @@ export default {
 				{ label: 'Last 7 days', value: '7d' },
 				{ label: 'Last 15 days', value: '15d' },
 			],
-		};
+		}
 	},
 	mounted() {
-		// Initialise date range from URL if present
-		const start = dayjs(this.$route.query.start);
-		const end = dayjs(this.$route.query.end);
+		// Initialize date range from URL if present
+		const start = dayjs(this.$route.query.start)
+		const end = dayjs(this.$route.query.end)
 		if (start.isValid && end.isValid && start.isBefore(end)) {
-			this.updateStartDate(start);
-			this.updateEndDate(end);
+			this.updateStartDate(start)
+			this.updateEndDate(end)
 		} else {
-			this.applyDefaultDateRange();
+			this.applyDefaultDateRange()
 		}
 
 		// Highlight card if element hash found in URL
 		if (typeof this.$route.hash === 'string') {
-			const slug = this.$route.hash.replace('#', '');
-			this.highlightCard(slug);
+			const slug = this.$route.hash.replace('#', '')
+			this.highlightCard(slug)
 		}
 	},
 	resources: {
@@ -561,22 +595,47 @@ export default {
 					end: this.logicalEndDate,
 				},
 				auto: this.logicalStartDate && this.logicalEndDate,
-			};
+			}
 		},
-		advancedAnalytics() {
-			return {
-				url: 'press.api.analytics.get_advanced_analytics',
-				params: {
-					name: this.name,
-					timezone: this.localTimezone,
-					start: this.logicalStartDate,
-					end: this.logicalEndDate,
-				},
-				auto:
-					this.showAdvancedAnalytics &&
-					this.logicalStartDate &&
-					this.logicalEndDate,
-			};
+		requestCountByPath() {
+			return this.advancedAnalyticsResource(
+				'press.api.analytics.get_request_count_by_path',
+			)
+		},
+		requestDurationByPath() {
+			return this.advancedAnalyticsResource(
+				'press.api.analytics.get_request_duration_by_path',
+			)
+		},
+		averageRequestDurationByPath() {
+			return this.advancedAnalyticsResource(
+				'press.api.analytics.get_average_request_duration_by_path',
+			)
+		},
+		requestCountByIp() {
+			return this.advancedAnalyticsResource(
+				'press.api.analytics.get_request_count_by_ip',
+			)
+		},
+		backgroundJobCountByMethod() {
+			return this.advancedAnalyticsResource(
+				'press.api.analytics.get_background_job_count_by_method',
+			)
+		},
+		backgroundJobDurationByMethod() {
+			return this.advancedAnalyticsResource(
+				'press.api.analytics.get_background_job_duration_by_method',
+			)
+		},
+		averageBackgroundJobDurationByMethod() {
+			return this.advancedAnalyticsResource(
+				'press.api.analytics.get_average_background_job_duration_by_method',
+			)
+		},
+		backgroundJobUsage() {
+			return this.advancedAnalyticsResource(
+				'press.api.analytics.get_background_job_usage',
+			)
 		},
 		slowLogsCount() {
 			return {
@@ -593,7 +652,7 @@ export default {
 					this.showAdvancedAnalytics &&
 					this.logicalStartDate &&
 					this.logicalEndDate,
-			};
+			}
 		},
 		slowLogsDuration() {
 			return {
@@ -610,10 +669,22 @@ export default {
 					this.showAdvancedAnalytics &&
 					this.logicalStartDate &&
 					this.logicalEndDate,
-			};
+			}
 		},
 	},
 	computed: {
+		advancedAnalyticsError() {
+			return [
+				this.$resources.requestCountByPath,
+				this.$resources.requestDurationByPath,
+				this.$resources.averageRequestDurationByPath,
+				this.$resources.requestCountByIp,
+				this.$resources.backgroundJobCountByMethod,
+				this.$resources.backgroundJobDurationByMethod,
+				this.$resources.averageBackgroundJobDurationByMethod,
+				this.$resources.backgroundJobUsage,
+			].find((resource) => resource.error)?.error
+		},
 		requestChartColors() {
 			return [
 				this.$theme.colors.green[500],
@@ -626,13 +697,13 @@ export default {
 				this.$theme.colors.cyan[500],
 				this.$theme.colors.gray[500],
 				this.$theme.colors.orange[500],
-			];
+			]
 		},
 		usageCounterData() {
-			let data = this.$resources.analytics.data?.usage_counter;
-			if (!data) return;
+			let data = this.$resources.analytics.data?.usage_counter
+			if (!data) return
 
-			let plan_limit = this.$resources.analytics.data?.plan_limit;
+			let plan_limit = this.$resources.analytics.data?.plan_limit
 
 			return {
 				datasets: [data.map((d) => [+new Date(d.date), d.value / 1000000])],
@@ -653,188 +724,207 @@ export default {
 					],
 					symbol: ['none', 'none'],
 				},
-			};
+			}
 		},
 		requestCountData() {
-			let requestCount = this.$resources.analytics.data?.request_count;
-			if (!requestCount) return;
+			let requestCount = this.$resources.analytics.data?.request_count
+			if (!requestCount) return
 
 			return {
 				datasets: [requestCount.map((d) => [+new Date(d.date), d.value])],
-			};
+			}
 		},
 		requestCountByPathData() {
 			let requestCountByPath =
-				this.$resources.advancedAnalytics.data?.request_count_by_path;
-			if (!requestCountByPath) return;
+				this.$resources.requestCountByPath.data?.request_count_by_path
+			if (!requestCountByPath) return
 
-			return requestCountByPath;
+			return requestCountByPath
 		},
 		requestDurationByPathData() {
 			let requestDurationByPath =
-				this.$resources.advancedAnalytics.data?.request_duration_by_path;
-			if (!requestDurationByPath) return;
+				this.$resources.requestDurationByPath.data?.request_duration_by_path
+			if (!requestDurationByPath) return
 
-			return requestDurationByPath;
+			return requestDurationByPath
 		},
 		queryReportRunReportsData() {
 			let queryReportRunReports =
-				this.$resources.advancedAnalytics.data?.query_report_run_reports;
-			if (!queryReportRunReports) return;
+				this.$resources.requestDurationByPath.data?.query_report_run_reports
+			if (!queryReportRunReports) return
 
-			return queryReportRunReports;
+			return queryReportRunReports
 		},
 		runDocMethodMethodnamesData() {
 			let runDocMethodMethodnames =
-				this.$resources.advancedAnalytics.data?.run_doc_method_methodnames;
-			if (!runDocMethodMethodnames) return;
+				this.$resources.requestDurationByPath.data?.run_doc_method_methodnames
+			if (!runDocMethodMethodnames) return
 
-			return runDocMethodMethodnames;
+			return runDocMethodMethodnames
 		},
 		saveDocsDoctypesData() {
 			let saveDocDoctypes =
-				this.$resources.advancedAnalytics.data?.save_docs_doctypes;
-			if (!saveDocDoctypes) return;
+				this.$resources.requestDurationByPath.data?.save_docs_doctypes
+			if (!saveDocDoctypes) return
 
-			return saveDocDoctypes;
+			return saveDocDoctypes
 		},
 		saveDocsActionData() {
 			let saveDocActions =
-				this.$resources.advancedAnalytics.data?.save_docs_actions;
-			if (!saveDocActions) return;
+				this.$resources.requestDurationByPath.data?.save_docs_actions
+			if (!saveDocActions) return
 
-			return saveDocActions;
+			return saveDocActions
 		},
 		generateReportReportsData() {
 			let generateReportReports =
-				this.$resources.advancedAnalytics.data?.generate_report_reports;
-			if (!generateReportReports) return;
+				this.$resources.backgroundJobDurationByMethod.data
+					?.generate_report_reports
+			if (!generateReportReports) return
 
-			return generateReportReports;
+			return generateReportReports
 		},
 		averageRequestDurationByPathData() {
 			let averageRequestDurationByPath =
-				this.$resources.advancedAnalytics.data
-					?.average_request_duration_by_path;
-			if (!averageRequestDurationByPath) return;
+				this.$resources.averageRequestDurationByPath.data
+					?.average_request_duration_by_path
+			if (!averageRequestDurationByPath) return
 
-			return averageRequestDurationByPath;
+			return averageRequestDurationByPath
 		},
 		requestCountByIPData() {
 			let requestCountByIP =
-				this.$resources.advancedAnalytics.data?.request_count_by_ip;
-			if (!requestCountByIP) return;
+				this.$resources.requestCountByIp.data?.request_count_by_ip
+			if (!requestCountByIP) return
 
-			return requestCountByIP;
+			return requestCountByIP
 		},
 		backgroundJobCountByMethodData() {
 			let backgroundJobCountByMethod =
-				this.$resources.advancedAnalytics.data?.background_job_count_by_method;
-			if (!backgroundJobCountByMethod) return;
+				this.$resources.backgroundJobCountByMethod.data
+					?.background_job_count_by_method
+			if (!backgroundJobCountByMethod) return
 
-			return backgroundJobCountByMethod;
+			return backgroundJobCountByMethod
 		},
 		backgroundJobDurationByMethodData() {
 			let backgroundJobDurationByMethod =
-				this.$resources.advancedAnalytics.data
-					?.background_job_duration_by_method;
-			if (!backgroundJobDurationByMethod) return;
+				this.$resources.backgroundJobDurationByMethod.data
+					?.background_job_duration_by_method
+			if (!backgroundJobDurationByMethod) return
 
-			return backgroundJobDurationByMethod;
+			return backgroundJobDurationByMethod
 		},
 		averageBackgroundJobDurationByMethodData() {
 			let averageBackgroundJobDurationByMethod =
-				this.$resources.advancedAnalytics.data
-					?.average_background_job_duration_by_method;
-			if (!averageBackgroundJobDurationByMethod) return;
+				this.$resources.averageBackgroundJobDurationByMethod.data
+					?.average_background_job_duration_by_method
+			if (!averageBackgroundJobDurationByMethod) return
 
-			return averageBackgroundJobDurationByMethod;
+			return averageBackgroundJobDurationByMethod
 		},
 		slowLogsDurationData() {
-			const slowLogs = this.$resources.slowLogsDuration.data;
-			if (!slowLogs) return;
+			const slowLogs = this.$resources.slowLogsDuration.data
+			if (!slowLogs) return
 
-			return slowLogs;
+			return slowLogs
 		},
 		slowLogsCountData() {
-			const slowLogs = this.$resources.slowLogsCount.data;
-			if (!slowLogs) return;
+			const slowLogs = this.$resources.slowLogsCount.data
+			if (!slowLogs) return
 
-			return slowLogs;
+			return slowLogs
 		},
 		requestTimeData() {
-			let requestCpuTime = this.$resources.analytics.data?.request_cpu_time;
-			if (!requestCpuTime) return;
+			let requestCpuTime = this.$resources.analytics.data?.request_cpu_time
+			if (!requestCpuTime) return
 
 			return {
 				datasets: [
 					requestCpuTime.map((d) => [+new Date(d.date), d.value / 1000000]),
 				],
-			};
+			}
 		},
 		jobCountData() {
-			let jobCount = this.$resources.advancedAnalytics.data?.job_count;
-			if (!jobCount) return;
+			let jobCount = this.$resources.backgroundJobUsage.data?.job_count
+			if (!jobCount) return
 
 			return {
 				datasets: [jobCount.map((d) => [+new Date(d.date), d.value])],
-			};
+			}
 		},
 		jobTimeData() {
-			let jobCpuTime = this.$resources.advancedAnalytics.data?.job_cpu_time;
-			if (!jobCpuTime) return;
+			let jobCpuTime = this.$resources.backgroundJobUsage.data?.job_cpu_time
+			if (!jobCpuTime) return
 
 			return {
 				datasets: [
 					jobCpuTime.map((d) => [+new Date(d.date), d.value / 1000000]),
 				],
-			};
+			}
 		},
 		shareDashboardActionPrefix() {
-			return () => h(ShareIcon, { class: 'w-4 h-4' });
+			return () => h(LucideLink, { class: 'size-3.5' })
 		},
 	},
 	methods: {
+		advancedAnalyticsResource(url) {
+			// Each advanced-analytics chart is its own request so they run in
+			// parallel across workers instead of serially in one handler.
+			return {
+				url,
+				params: {
+					name: this.name,
+					timezone: this.localTimezone,
+					start: this.logicalStartDate,
+					end: this.logicalEndDate,
+				},
+				auto:
+					this.showAdvancedAnalytics &&
+					this.logicalStartDate &&
+					this.logicalEndDate,
+			}
+		},
 		toggleAdvancedAnalytics() {
-			this.showAdvancedAnalytics = !this.showAdvancedAnalytics;
+			this.showAdvancedAnalytics = !this.showAdvancedAnalytics
 		},
 		handleDataZoom(evt) {
-			clearTimeout(this._zoomTimeout);
+			clearTimeout(this._zoomTimeout)
 
 			this._zoomTimeout = setTimeout(() => {
-				const { startDate, endDate } = evt;
-				this.updateStartDate(startDate);
-				this.updateEndDate(endDate);
-			}, 500); // debounce
+				const { startDate, endDate } = evt
+				this.updateStartDate(startDate)
+				this.updateEndDate(endDate)
+			}, 500) // debounce
 		},
 		dateFormatter(dateString) {
 			return dayjs(dateString, 'YYYY-MM-DD HH:mm:ss').format(
 				'MMM D, YYYY h:mm A',
-			);
+			)
 		},
 		resetDateRangeError(msg = null) {
-			this.dateRangeError = msg;
+			this.dateRangeError = msg
 		},
 		resetDurationField(value = null) {
-			this.duration = value;
+			this.duration = value
 		},
 		applyDefaultDateRange() {
-			this.duration = this.defaultDuration;
+			this.duration = this.defaultDuration
 		},
 		syncLogicalDateRange() {
-			this.logicalStartDate = this.inputStartDate;
-			this.logicalEndDate = this.inputEndDate;
+			this.logicalStartDate = this.inputStartDate
+			this.logicalEndDate = this.inputEndDate
 		},
 		validateDateRange(start = this.inputStartDate, end = this.inputEndDate) {
-			return dayjs(start).isBefore(dayjs(end));
+			return dayjs(start).isBefore(dayjs(end))
 		},
 		updateStartDate(newStartDate, resetDuration = true) {
-			this.resetDateRangeError();
+			this.resetDateRangeError()
 			if (resetDuration) {
-				this.resetDurationField();
+				this.resetDurationField()
 			}
 
-			this.inputStartDate = dayjs(newStartDate);
+			this.inputStartDate = dayjs(newStartDate)
 
 			if (this.allowTimestampSyncToUrl) {
 				// Update the query params
@@ -844,22 +934,22 @@ export default {
 						start: this.inputStartDate?.toISOString(),
 						end: this.inputEndDate?.toISOString(),
 					},
-				});
+				})
 			}
 
 			if (!this.validateDateRange()) {
-				this.dateRangeError = 'Invalid date range';
+				this.dateRangeError = 'Invalid date range'
 			} else {
-				this.syncLogicalDateRange();
+				this.syncLogicalDateRange()
 			}
 		},
 		updateEndDate(newEndDate, resetDuration = true) {
-			this.resetDateRangeError();
+			this.resetDateRangeError()
 			if (resetDuration) {
-				this.resetDurationField();
+				this.resetDurationField()
 			}
 
-			this.inputEndDate = dayjs(newEndDate);
+			this.inputEndDate = dayjs(newEndDate)
 
 			if (this.allowTimestampSyncToUrl) {
 				// Update the query params
@@ -869,52 +959,54 @@ export default {
 						start: this.inputStartDate?.toISOString(),
 						end: this.inputEndDate?.toISOString(),
 					},
-				});
+				})
 			}
 
 			if (!this.validateDateRange()) {
-				this.dateRangeError = 'Invalid date range';
+				this.dateRangeError = 'Invalid date range'
 			} else {
-				this.syncLogicalDateRange();
+				this.syncLogicalDateRange()
 			}
 		},
 		highlightCard(slug) {
-			if (!slug) return;
+			if (!slug) return
 
 			document.getElementById(slug)?.scrollIntoView({
 				behavior: 'smooth',
 				block: 'center',
-			});
+			})
 		},
 		shareDashboard(evt, context = 'card') {
 			if (!['card', 'global'].includes(context))
-				throw new Error('Invalid share context');
+				throw new Error('Invalid share context')
 
 			if (context === 'card') {
 				const url = new URL(
 					`${window.location.href}?start=${this.inputStartDate}&end=${this.inputEndDate}`,
-				);
-				url.hash = `#${evt}`;
-				navigator.clipboard?.writeText(url.toString());
-				toast.success('Card link copied to clipboard!');
+				)
+				url.hash = `#${evt}`
+				navigator.clipboard?.writeText(url.toString())
+				toast.success('Card link copied to clipboard!')
 			} else if (context === 'global') {
 				const url = new URL(
 					`${window.location.href}?start=${this.inputStartDate}&end=${this.inputEndDate}`,
-				);
-				navigator.clipboard?.writeText(url.toString());
-				toast.success('Dashboard link copied to clipboard!');
+				)
+				navigator.clipboard?.writeText(url.toString())
+				toast.success('Dashboard link copied to clipboard!')
 			}
 		},
 	},
 	watch: {
 		duration(newValue) {
-			if (!newValue) return;
-			this.now = dayjs();
-			this.updateEndDate(this.now, false);
-			const int = parseInt(newValue.slice(0, -1));
-			const unit = newValue.slice(-1);
-			this.updateStartDate(dayjs(this.inputEndDate).subtract(int, unit), false);
+			if (!newValue) return
+			this.now = dayjs()
+			// floor to 15 minutes to avoid issues with caching
+			const flooredEndDate = dayjsFloorToMinutes(this.now, 15)
+			this.updateEndDate(flooredEndDate, false)
+			const int = parseInt(newValue.slice(0, -1))
+			const unit = newValue.slice(-1)
+			this.updateStartDate(dayjs(this.inputEndDate).subtract(int, unit), false)
 		},
 	},
-};
+}
 </script>

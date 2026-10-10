@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 	from collections.abc import Iterable
 
 	from press.press.doctype.proxy_server.proxy_server import ProxyServer
+	from press.press.doctype.tls_certificate.tls_certificate import TLSCertificate
 
 
 class RootDomain(Document):
@@ -169,12 +170,13 @@ class RootDomain(Document):
 			if to_delete:
 				self.delete_dns_records(to_delete)
 
-	def update_dns_records_for_sites(self, sites: list[str], proxy_server: str):
+	def update_dns_records_for_sites(
+		self, sites: list[str], proxy_server: str, batch_size: int = 500, ttl: int = 600
+	):
 		if self.generic_dns_provider:
 			return
 
-		# update records in batches of 500
-		batch_size = 500
+		# update records in batches
 		for i in range(0, len(sites), batch_size):
 			changes = []
 			for site in sites[i : i + batch_size]:
@@ -184,7 +186,7 @@ class RootDomain(Document):
 						"ResourceRecordSet": {
 							"Name": site,
 							"Type": "CNAME",
-							"TTL": 600,
+							"TTL": ttl,
 							"ResourceRecords": [{"Value": proxy_server}],
 						},
 					}
@@ -196,11 +198,37 @@ class RootDomain(Document):
 
 	@frappe.whitelist()
 	def add_to_proxies(self):
+		if not frappe.db.exists(
+			"TLS Certificate",
+			{
+				"domain": self.name,
+			},
+		):
+			frappe.throw("Please obtain a TLS certificate for this domain before adding it to proxy servers.")
+
+		tls_ceritificate: TLSCertificate = frappe.get_doc("TLS Certificate", {"domain": self.name})
+		if not (
+			tls_ceritificate.certificate
+			and tls_ceritificate.private_key
+			and tls_ceritificate.intermediate_chain
+		):
+			frappe.throw(
+				"Please obtain a valid TLS certificate for this domain before adding it to proxy servers."
+			)
+
 		proxies = frappe.get_all("Proxy Server", {"status": "Active"}, pluck="name")
 		for proxy_name in proxies:
 			proxy: ProxyServer = frappe.get_doc("Proxy Server", proxy_name)
-			proxy.append("domains", {"domain": self.name})
-			proxy.save()
+			is_exist = False
+			for domain in proxy.domains:
+				if domain.domain == self.name:
+					is_exist = True
+					break
+
+			if not is_exist:
+				proxy.append("domains", {"domain": self.name})
+				proxy.save()
+
 			proxy.setup_wildcard_hosts()
 
 
@@ -217,3 +245,11 @@ def cleanup_cname_records():
 @redis_cache(ttl=3600)
 def get_domains():
 	return frappe.get_all("Root Domain", filters={"enabled": ["=", "1"]}, pluck="name")
+
+
+def get_matching_domain(domain: str) -> str | None:
+	root_domains = get_domains()
+	for rd in root_domains:
+		if domain == rd or domain.endswith(f".{rd}"):
+			return rd
+	return None
