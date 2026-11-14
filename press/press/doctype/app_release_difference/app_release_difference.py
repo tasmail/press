@@ -8,7 +8,7 @@ import typing
 
 import frappe
 from frappe.model.document import Document
-from github import Github
+from github import Github  # type: ignore[import-untyped]
 
 from press.api.github import get_access_token
 

@@ -59,7 +59,7 @@ def create_gitlab_app_source(
 	"""A GitLab App Source that makes no API call on insert. `hooks` is the text of the app's hooks.py."""
 	app = create_test_app("ua_prro", "UA PRRO")
 	with (
-		patch.object(AppSource, "after_insert", new=lambda self: None),
+		patch.object(AppSource, "create_release", new=lambda self, *args, **kwargs: None),
 		patch("press.utils.gitlab.raw_file", return_value=hooks),
 	):
 		return frappe.get_doc(

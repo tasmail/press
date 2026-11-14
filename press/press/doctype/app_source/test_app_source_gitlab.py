@@ -113,7 +113,7 @@ class TestGitLabAppSource(FrappeTestCase):
 	def test_hooks_py_is_fetched_from_the_gitlab_api_for_the_branch(self):
 		hooks = fake_response(text=HOOKS_WITH_REQUIRED_APPS)
 		with (
-			patch.object(AppSource, "after_insert", new=lambda self: None),
+			patch.object(AppSource, "create_release", new=lambda self, *args, **kwargs: None),
 			patch("press.utils.gitlab.requests.get", return_value=hooks) as get,
 		):
 			create_gitlab_app_source_with_real_api()
@@ -124,7 +124,7 @@ class TestGitLabAppSource(FrappeTestCase):
 
 	def test_a_failed_hooks_fetch_does_not_block_the_save(self):
 		with (
-			patch.object(AppSource, "after_insert", new=lambda self: None),
+			patch.object(AppSource, "create_release", new=lambda self, *args, **kwargs: None),
 			patch("press.utils.gitlab.requests.get", return_value=fake_response(404, text="404")),
 		):
 			source = create_gitlab_app_source_with_real_api()
@@ -403,6 +403,7 @@ class TestGitLabApiPaths(FrappeTestCase):
 				"press.press.doctype.app_source.app_source.parse_frappe_version", return_value=["Version 14"]
 			) as parse,
 			patch("press.press.doctype.app_source.app_source.get_repo_app_info") as github_info,
+			patch.object(AppSource, "create_release"),
 		):
 			self.source.sync_versions()
 
@@ -534,7 +535,10 @@ class TestGitLabSourceBenchRefusals(FrappeTestCase):
 
 		with self.assertRaises(frappe.ValidationError) as raised:
 			ReleaseGroup._validate_frappe_branch_matches_bench_version(Mock(), self.source, "version-15")
-		self.assertEqual(str(raised.exception), "The Frappe framework from a GitLab source is not supported.")
+		self.assertEqual(
+			str(raised.exception),
+			"The Frappe framework from a GitLab source is not supported. Use a GitHub source for the framework.",
+		)
 
 
 class TestGitLabReleaseGroup(FrappeTestCase):

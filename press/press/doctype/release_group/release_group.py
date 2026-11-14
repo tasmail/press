@@ -1756,7 +1756,9 @@ class ReleaseGroup(Document, TagHelpers):
 		self, current_app_source: AppSource, to_branch: str
 	) -> None:
 		if current_app_source.provider == "GitLab":
-			frappe.throw("The Frappe framework from a GitLab source is not supported.")
+			frappe.throw(
+				"The Frappe framework from a GitLab source is not supported. Use a GitHub source for the framework."
+			)
 
 		target_major_version = get_frappe_branch_major_version(
 			current_app_source.repository_owner,

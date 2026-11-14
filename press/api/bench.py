@@ -988,7 +988,7 @@ def validate_gitlab_branch(app_source: AppSource, branch: str) -> dict:
 	try:
 		return gitlab.to_github_shape(gitlab.branch(app_source.project_path, branch), by_commit=False)
 	except gitlab.GitLabError as e:
-		frappe.throw("Error validating branch from GitLab: " + str(e))
+		raise frappe.ValidationError(f"Error validating branch from GitLab: {e}") from e
 
 
 def get_branches_for_marketplace_app(app: str, marketplace_app: str, app_source: AppSource) -> list[dict]:

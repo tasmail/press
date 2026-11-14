@@ -91,7 +91,7 @@ class TestGitHubSourcesStayOnTheGitHubPath(FrappeTestCase):
 			app = frappe.get_doc({"doctype": "App", "name": "hrms", "title": "HRMS"}).insert(
 				ignore_if_duplicate=True
 			)
-			with patch.object(AppSource, "after_insert", new=Mock()):
+			with patch.object(AppSource, "create_release", new=Mock()):
 				self.source = app.add_source(
 					frappe_version="Nightly",
 					repository_url="https://github.com/frappe/hrms",
