@@ -17,7 +17,7 @@ from frappe.model.document import Document
 
 from press.api.github import GithubFetchError, get_access_token
 from press.press.doctype.app_source.app_source import AppSource
-from press.utils import log_error
+from press.utils import gitlab, log_error
 
 if typing.TYPE_CHECKING:
 	from press.press.doctype.deploy_candidate.deploy_candidate import DeployCandidate
@@ -206,7 +206,11 @@ class AppRelease(Document):
 
 	def get_commit_link(self) -> str:
 		"""Return the commit URL for this app release"""
-		return f"{self.get_source().repository_url}/commit/{self.hash}"
+		source = self.get_source()
+		if source.provider == "GitLab":
+			return gitlab.commit_url(source.repository_url, self.hash)
+
+		return f"{source.repository_url}/commit/{self.hash}"
 
 	@frappe.whitelist()
 	def clone(self):
@@ -243,8 +247,8 @@ class AppRelease(Document):
 			self.cleanup()
 			log_error(
 				"App Release Command Exception",
-				command=command,
-				output=e.output.decode(),
+				command=gitlab.redact(command),
+				output=gitlab.redact(e.output.decode()),
 				doc=self,
 			)
 			raise e
@@ -287,6 +291,9 @@ class AppRelease(Document):
 		except subprocess.CalledProcessError as e:
 			stdout = e.stdout.decode("utf-8")
 
+			if source.provider == "GitLab":
+				self.raise_gitlab_fetch_failure(stdout)
+
 			if not (
 				"fatal: could not read Username for 'https://github.com'" in stdout
 				or "Repository not found." in stdout
@@ -308,6 +315,14 @@ class AppRelease(Document):
 
 		self.output += self.run(f"git checkout {self.hash}")
 		self.output += self.run(f"git reset --hard {self.hash}")
+
+	def raise_gitlab_fetch_failure(self, git_output: str):
+		"""Do not edit without updating deploy_notifications.py"""
+		message = gitlab.redact(git_output)
+		frappe.log_error(
+			title="App Release Clone Error", message=f"GitLab fetch failed for {self.app}:\n{message}"
+		)
+		raise Exception("Repository could not be fetched", self.app) from None
 
 	def _get_repo_url(self, source: "AppSource") -> str:
 		if not source.github_installation_id:

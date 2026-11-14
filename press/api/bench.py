@@ -39,6 +39,7 @@ from press.utils import (
 	get_app_tag,
 	get_client_blacklisted_keys,
 	get_current_team,
+	gitlab,
 	unique,
 )
 
@@ -937,6 +938,9 @@ def branch_list(name: str, app: str) -> list[dict]:
 	rg: ReleaseGroup = frappe.get_doc("Release Group", name)
 	app_source = rg.get_app_source(app)
 
+	if app_source.provider == "GitLab":
+		return gitlab.branches(app_source.project_path)
+
 	installation_id = app_source.github_installation_id
 	repo_owner = app_source.repository_owner
 	repo_name = app_source.repository
@@ -955,6 +959,9 @@ def validate_branch(name: str, app: str, branch: str):
 	"""Validates whether a branch is available for the `app`"""
 	release_group = frappe.get_doc("Release Group", name)
 	app_source = release_group.get_app_source(app)
+
+	if app_source.provider == "GitLab":
+		return validate_gitlab_branch(app_source, branch)
 
 	token = get_access_token(app_source.github_installation_id)
 
@@ -975,6 +982,13 @@ def validate_branch(name: str, app: str, branch: str):
 		return response.json()
 	frappe.throw("Error validating branch from GitHub: " + response.text)
 	return None
+
+
+def validate_gitlab_branch(app_source: AppSource, branch: str) -> dict:
+	try:
+		return gitlab.to_github_shape(gitlab.branch(app_source.project_path, branch), by_commit=False)
+	except gitlab.GitLabError as e:
+		frappe.throw("Error validating branch from GitLab: " + str(e))
 
 
 def get_branches_for_marketplace_app(app: str, marketplace_app: str, app_source: AppSource) -> list[dict]:

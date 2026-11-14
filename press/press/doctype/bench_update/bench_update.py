@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import frappe
 from frappe.model.document import Document
 
-from press.utils import get_current_team
+from press.utils import get_current_team, gitlab
 
 if TYPE_CHECKING:
 	from press.press.doctype.bench.bench import Bench
@@ -65,6 +65,7 @@ class BenchUpdate(Document):
 				frappe.throw("An update is already pending for this site", frappe.ValidationError)
 
 	def validate_inplace_update(self):
+		gitlab.refuse_gitlab_sources([app.source for app in self.apps], "An in place update")
 		sites = [s.site for s in self.sites if s.site]
 		if len(sites) == 0:
 			frappe.throw(

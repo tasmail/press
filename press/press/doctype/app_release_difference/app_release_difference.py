@@ -66,12 +66,23 @@ class AppReleaseDifference(Document):
 
 		return False
 
+	def set_deploy_type_for_gitlab(self):
+		self.add_comment("Info", "GitLab source: the diff is not read, so assuming migrate required")
+		self.deploy_type = "Migrate"
+		self.save()
+
 	def set_deploy_type(self):
 		if self.deploy_type != "Pending":
 			return
 		self.deploy_type = "Pull"
 
 		source = frappe.get_doc("App Source", self.source)
+		if source.provider == "GitLab":
+			self.set_deploy_type_for_gitlab()
+		else:
+			self.set_deploy_type_from_github(source)
+
+	def set_deploy_type_from_github(self, source):
 		if source.github_installation_id:
 			try:
 				github_access_token = get_access_token(source.github_installation_id)

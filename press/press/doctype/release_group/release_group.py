@@ -47,6 +47,7 @@ from press.utils import (
 	get_client_blacklisted_keys,
 	get_current_team,
 	get_last_doc,
+	gitlab,
 	log_error,
 )
 from press.utils.environment_variable import validate_environment_variable
@@ -1754,6 +1755,9 @@ class ReleaseGroup(Document, TagHelpers):
 	def _validate_frappe_branch_matches_bench_version(
 		self, current_app_source: AppSource, to_branch: str
 	) -> None:
+		if current_app_source.provider == "GitLab":
+			frappe.throw("The Frappe framework from a GitLab source is not supported.")
+
 		target_major_version = get_frappe_branch_major_version(
 			current_app_source.repository_owner,
 			current_app_source.repository,
@@ -2415,6 +2419,11 @@ def _has_active_benches(previous_candidate: "DeployCandidate") -> bool:
 
 def can_run_patch_build(release_group: str) -> bool:
 	if not frappe.db.get_single_value("Press Settings", "allow_patch_builds"):
+		return False
+
+	if gitlab.gitlab_source_among(
+		frappe.get_all("Release Group App", {"parent": release_group}, pluck="source")
+	):
 		return False
 
 	previous_candidate = _get_previous_candidate(release_group)

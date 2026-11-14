@@ -34,7 +34,7 @@ from press.press.doctype.deploy_candidate.utils import (
 	is_suspended,
 )
 from press.press.doctype.release_group.release_group import DEFAULT_DEPENDENCIES
-from press.utils import log_error
+from press.utils import gitlab, log_error
 
 # build_duration, pending_duration are Time fields, >= 1 day is invalid
 MAX_DURATION = timedelta(hours=23, minutes=59, seconds=59)
@@ -247,6 +247,8 @@ class DeployCandidate(Document):
 				error=True,
 				message="Builds are currently suspended. Please try again later.",
 			)
+
+		gitlab.refuse_gitlab_sources([app.source for app in self.apps], "A patch build")
 
 		deploy_candidate_build = self.create_build(no_cache=False, deploy_after_build=True, patch_build=True)
 		deploy_candidate_build.insert(ignore_permissions=ignore_permissions)

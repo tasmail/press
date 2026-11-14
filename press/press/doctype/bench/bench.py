@@ -31,6 +31,7 @@ from press.utils import (
 	SupervisorProcess,
 	flatten,
 	get_datetime,
+	gitlab,
 	log_error,
 	parse_supervisor_status,
 )
@@ -935,6 +936,7 @@ class Bench(Document):
 		return self.remove_scheduler_status(processes)
 
 	def update_inplace(self, apps: "list[BenchUpdateApp]", sites: "list[str]") -> str:
+		gitlab.refuse_gitlab_sources([app.source for app in apps], "An in place update")
 		self.set_self_and_site_status(sites, status="Updating", site_status="Updating")
 		self.save()
 		job = Agent(self.server).create_agent_job(

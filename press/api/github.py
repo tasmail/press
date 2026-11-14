@@ -21,7 +21,7 @@ import semantic_version as sv
 import tomli
 from frappe.utils.verified_command import get_secret
 
-from press.utils import docs, get_current_team, log_error
+from press.utils import docs, get_current_team, gitlab, log_error
 
 if TYPE_CHECKING:
 	from press.press.doctype.github_webhook_log.github_webhook_log import GitHubWebhookLog
@@ -416,6 +416,9 @@ def branches(owner: str, name: str, installation: str | None = None, app_source:
 	"""
 	Return ALL branches for the repo, following GitHub pagination.
 	"""
+	if app_source and frappe.db.get_value("App Source", app_source, "provider") == "GitLab":
+		return gitlab.branches(frappe.db.get_value("App Source", app_source, "repository_path"))
+
 	if not installation and app_source:
 		installation = frappe.db.get_value("App Source", app_source, "github_installation_id")
 
@@ -461,7 +464,6 @@ def _get_compatible_frappe_version_from_pyproject(
 	owner: str, repository: str, branch_info: dict, headers: dict[str, str]
 ) -> str:
 	"""Get frappe version from pyproject.toml file."""
-	compatible_frappe_version: str | None = None
 	pyproject = requests.get(
 		f"https://api.github.com/repos/{owner}/{repository}/contents/pyproject.toml",
 		params={"ref": branch_info["name"]},
@@ -473,10 +475,14 @@ def _get_compatible_frappe_version_from_pyproject(
 			"We couldn't read the pyproject.toml file from this repository. Please make sure it exists at the app's root and that the selected branch is correct."
 		)
 
-	pyproject = b64decode(pyproject["content"]).decode()
+	return parse_frappe_version_from_pyproject(b64decode(pyproject["content"]).decode(), repository)
 
+
+def parse_frappe_version_from_pyproject(pyproject_text: str, repository: str | None) -> str:
+	"""Frappe version range from the text of a pyproject.toml."""
+	compatible_frappe_version: str | None = None
 	try:
-		pyproject = tomli.loads(pyproject)
+		pyproject = tomli.loads(pyproject_text)
 	except tomli.TOMLDecodeError as e:
 		out = []
 		out.append("Invalid pyproject.toml file found")
@@ -609,9 +615,14 @@ def _construct_tree(tree, children, children_map):
 
 
 def _get_pyproject_from_commit(app_source: str, commit: str):
-	repository_owner, repository, installation_id = frappe.db.get_value(
-		"App Source", app_source, ["repository_owner", "repository", "github_installation_id"]
+	repository_owner, repository, installation_id, provider, repository_path = frappe.db.get_value(
+		"App Source",
+		app_source,
+		["repository_owner", "repository", "github_installation_id", "provider", "repository_path"],
 	)
+	if provider == "GitLab":
+		return _get_pyproject_from_gitlab(repository_path, commit)
+
 	headers = get_auth_headers(installation_id)
 	url = f"https://api.github.com/repos/{repository_owner}/{repository}/contents/pyproject.toml"
 
@@ -624,6 +635,22 @@ def _get_pyproject_from_commit(app_source: str, commit: str):
 		frappe.throw("Error fetching app info from github", frappe.ValidationError)
 
 	content = b64decode(response.json().get("content", "")).decode()
+	try:
+		return tomli.loads(content)
+	except tomli.TOMLDecodeError:
+		frappe.throw("Invalid pyproject.toml file found in the app repository.", frappe.ValidationError)
+
+
+def _get_pyproject_from_gitlab(repository_path: str, commit: str):
+	try:
+		content = gitlab.raw_file(repository_path, "pyproject.toml", commit)
+	except gitlab.GitLabHTTPError as e:
+		if e.status_code == 404:
+			frappe.throw("Pyproject not found at this commit", frappe.ValidationError)
+		frappe.throw("Error fetching app info from GitLab", frappe.ValidationError)
+	except gitlab.GitLabError:
+		frappe.throw("Error fetching app info from GitLab", frappe.ValidationError)
+
 	try:
 		return tomli.loads(content)
 	except tomli.TOMLDecodeError:

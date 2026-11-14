@@ -14,6 +14,8 @@
 		"data_3",
 		"repository",
 		"repository_owner",
+		"repository_path",
+		"provider",
 		"branch",
 		"section_break_8",
 		"team",
@@ -47,6 +49,21 @@
 			"fieldname": "repository_owner",
 			"fieldtype": "Data",
 			"label": "Repository Owner",
+			"read_only": 1
+		},
+		{
+			"fieldname": "repository_path",
+			"fieldtype": "Data",
+			"label": "Repository Path",
+			"read_only": 1
+		},
+		{
+			"default": "GitHub",
+			"fieldname": "provider",
+			"fieldtype": "Select",
+			"in_standard_filter": 1,
+			"label": "Provider",
+			"options": "GitHub\nGitLab",
 			"read_only": 1
 		},
 		{
@@ -165,7 +182,7 @@
 	"links": [
 		{ "link_doctype": "Error Log", "link_fieldname": "reference_name" }
 	],
-	"modified": "2025-08-20 20:18:42.547327",
+	"modified": "2026-11-14 10:00:00.000000",
 	"modified_by": "Administrator",
 	"module": "Press",
 	"name": "App Source",
