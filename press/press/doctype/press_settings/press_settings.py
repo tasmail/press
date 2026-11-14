@@ -308,7 +308,18 @@ class PressSettings(Document):
 	def validate_gitlab(self):
 		if self.gitlab_url:
 			gitlab.validate_base_url(self.gitlab_url)
+		self.validate_gitlab_url_is_kept()
 		gitlab.validate_token_rows(self.gitlab_project_tokens)
+
+	def validate_gitlab_url_is_kept(self):
+		old_url = frappe.db.get_single_value("Press Settings", "gitlab_url")
+		if not old_url or gitlab.normalized_host(old_url) == gitlab.normalized_host(self.gitlab_url or ""):
+			return
+		if frappe.db.exists("App Source", {"provider": "GitLab"}):
+			frappe.throw(
+				"GitLab URL cannot change while GitLab App Sources exist. Archive or disable them first.",
+				frappe.ValidationError,
+			)
 
 	@frappe.whitelist()
 	def create_stripe_webhook(self):

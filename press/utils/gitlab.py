@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from datetime import date
 from typing import TYPE_CHECKING
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import frappe
 import requests
@@ -60,13 +60,21 @@ def validate_base_url(url: str) -> None:
 		)
 
 
+def normalized_host(url: str) -> str:
+	"""Host of a URL in one canonical form: decoded, lowercase, IDNA, without a trailing dot."""
+	host = unquote(urlsplit(url).hostname or "").strip().rstrip(".").lower()
+	try:
+		return host.encode("idna").decode("ascii")
+	except UnicodeError:
+		return host
+
+
 def provider_for(repository_url: str) -> str:
 	"""`GitLab` when the URL points to the configured GitLab host, otherwise `GitHub`."""
 	configured = base_url()
 	if not configured:
 		return "GitHub"
-	host = (urlsplit(repository_url).hostname or "").lower()
-	return "GitLab" if host == (urlsplit(configured).hostname or "").lower() else "GitHub"
+	return "GitLab" if normalized_host(repository_url) == normalized_host(configured) else "GitHub"
 
 
 def project_path_for(repository_url: str) -> str:
@@ -216,6 +224,8 @@ def branches(project_path: str) -> list[dict]:
 		found.extend({"name": item["name"]} for item in chunk)
 		if len(chunk) < PAGE_SIZE:
 			break
+	else:
+		raise GitLabError(f"Project {project_path} has more than {MAX_PAGES * PAGE_SIZE} branches")
 	found.sort(key=lambda item: (0 if item["name"].startswith("version-") else 1, item["name"]))
 	return found
 

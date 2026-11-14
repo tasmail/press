@@ -159,6 +159,7 @@ class GitHubWebhookLog(Document):
 				"branch": self.branch,
 				"repository": self.repository,
 				"repository_owner": self.repository_owner,
+				"provider": "GitHub",
 				"enabled": 1,
 			},
 			fields=["name", "app"],
@@ -208,7 +209,7 @@ def set_uninstalled(owner: str, repository: str | None = None):
 
 
 def get_sources(owner: str, repository: str | None = None) -> "list[str]":
-	filters = {"repository_owner": owner}
+	filters = {"repository_owner": owner, "provider": "GitHub"}
 	if repository:
 		filters["repository"] = repository
 

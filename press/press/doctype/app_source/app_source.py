@@ -191,8 +191,7 @@ class AppSource(Document):
 			frappe.throw("A GitLab source cannot have a GitHub installation", frappe.ValidationError)
 		if self.public:
 			frappe.throw("A GitLab source is always private", frappe.ValidationError)
-		if self.is_new() or self.has_value_changed("repository_url"):
-			self.validate_gitlab_token()
+		self.validate_gitlab_token()
 
 	def validate_gitlab_token(self):
 		try:

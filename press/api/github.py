@@ -417,6 +417,7 @@ def branches(owner: str, name: str, installation: str | None = None, app_source:
 	Return ALL branches for the repo, following GitHub pagination.
 	"""
 	if app_source and frappe.db.get_value("App Source", app_source, "provider") == "GitLab":
+		frappe.has_permission("App Source", doc=app_source, throw=True)
 		return gitlab.branches(frappe.db.get_value("App Source", app_source, "repository_path"))
 
 	if not installation and app_source:

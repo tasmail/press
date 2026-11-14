@@ -101,6 +101,18 @@ class TestGitLabDetection(FrappeTestCase):
 			with self.subTest(url=url):
 				self.assertEqual(gitlab.provider_for(url), "GitHub")
 
+	def test_host_spellings_of_the_gitlab_host_are_still_detected_and_then_refused(self):
+		for url in (
+			"https://git.example.test./erpnext/ua_prro",
+			"https://GIT.Example.TEST/erpnext/ua_prro",
+			"https://git%2Eexample.test/erpnext/ua_prro",
+		):
+			with self.subTest(url=url):
+				self.assertEqual(gitlab.provider_for(url), "GitLab")
+
+		with self.assertRaises(frappe.ValidationError):
+			gitlab.project_path_for("https://git.example.test./erpnext/ua_prro")
+
 	def test_project_path_accepts_git_suffix_and_trailing_slash(self):
 		self.assertEqual(gitlab.project_path_for(f"{GITLAB_URL}/{PROJECT_A}.git"), PROJECT_A)
 		self.assertEqual(gitlab.project_path_for(f"{GITLAB_URL}/{PROJECT_A}/"), PROJECT_A)
@@ -178,6 +190,14 @@ class TestGitLabTokens(FrappeTestCase):
 		with self.assertRaises(gitlab.GitLabError) as raised:
 			gitlab.token_for(PROJECT_B)
 		self.assertEqual(str(raised.exception), f"No GitLab token is configured for project {PROJECT_B}")
+
+	def test_a_project_whose_path_is_a_prefix_of_another_gets_only_its_own_token(self):
+		configure_gitlab((PROJECT_A, TOKEN_A), (PROJECT_A + "_x", TOKEN_B))
+
+		self.assertEqual(gitlab.token_for(PROJECT_A), TOKEN_A)
+		self.assertEqual(gitlab.token_for(PROJECT_A + "_x"), TOKEN_B)
+		with self.assertRaises(gitlab.GitLabError):
+			gitlab.token_for(PROJECT_A + "_xy")
 
 	def test_an_expired_token_is_refused(self):
 		configure_gitlab((PROJECT_A, TOKEN_A), expires_in_days=-1)
@@ -337,6 +357,18 @@ class TestGitLabApi(FrappeTestCase):
 		self.assertEqual(get.call_args_list[1].kwargs["params"], {"per_page": gitlab.PAGE_SIZE, "page": 2})
 		self.assertEqual(len(found), gitlab.PAGE_SIZE + 2)
 		self.assertEqual(found[0], {"name": "version-15"})
+
+	def test_a_project_with_more_branches_than_the_page_limit_raises(self):
+		page = [{"name": f"b{index}"} for index in range(gitlab.PAGE_SIZE)]
+		with (
+			patch("press.utils.gitlab.requests.get", return_value=fake_response(body=page)),
+			self.assertRaises(gitlab.GitLabError) as raised,
+		):
+			gitlab.branches(PROJECT_A)
+		self.assertEqual(
+			str(raised.exception),
+			f"Project {PROJECT_A} has more than {gitlab.MAX_PAGES * gitlab.PAGE_SIZE} branches",
+		)
 
 	def test_branch_and_commit_answers_are_mapped_to_the_github_shape(self):
 		info = {

@@ -357,6 +357,32 @@ class TestGitLabApiPaths(FrappeTestCase):
 		self.assertEqual(found, [{"name": "version-15"}, {"name": "main"}])
 		self.assertEqual(get.call_args.args[0], f"{API_BASE}/repository/branches")
 
+	def test_branches_of_a_gitlab_source_need_permission_on_the_source(self):
+		denial = frappe.PermissionError("No permission for App Source")
+		with (
+			patch("press.api.github.frappe.has_permission", side_effect=denial) as has_permission,
+			patch("press.utils.gitlab.requests.get") as get,
+			self.assertRaises(frappe.PermissionError),
+		):
+			branches("erpnext", "ua_prro", app_source=self.source.name)
+
+		self.assertEqual(has_permission.call_args.kwargs, {"doc": self.source.name, "throw": True})
+		get.assert_not_called()
+
+	def test_github_webhooks_never_touch_a_gitlab_source_with_the_same_owner_and_name(self):
+		from types import SimpleNamespace
+
+		from press.press.doctype.github_webhook_log.github_webhook_log import GitHubWebhookLog, get_sources
+
+		log = SimpleNamespace(branch="main", repository="ua_prro", repository_owner="erpnext")
+		payload = {"head_commit": {"id": COMMIT_HASH}}
+		with patch("press.press.doctype.github_webhook_log.github_webhook_log.create_app_release") as create:
+			GitHubWebhookLog.create_app_releases(log, payload)
+
+		create.assert_not_called()
+		self.assertEqual(get_sources("erpnext", "ua_prro"), [])
+		self.assertEqual(get_sources("erpnext"), [])
+
 	def test_branch_validation_returns_the_github_shape_and_redacts_errors(self):
 		from press.api.bench import validate_gitlab_branch
 
@@ -622,3 +648,25 @@ class TestPressSettingsGitLab(FrappeTestCase):
 		with self.assertRaises(frappe.ValidationError) as raised:
 			settings.validate_gitlab()
 		self.assertEqual(str(raised.exception), f"GitLab project {PROJECT_A} is listed twice")
+
+
+class TestGitLabUrlIsKept(FrappeTestCase):
+	def tearDown(self):
+		frappe.db.rollback()
+
+	def test_the_gitlab_url_cannot_change_or_be_cleared_while_gitlab_sources_exist(self):
+		configure_gitlab((PROJECT_A, TOKEN_A))
+		create_gitlab_app_source()
+		settings = frappe.get_doc("Press Settings")
+
+		for url in ("", "https://other.example.test"):
+			settings.gitlab_url = url
+			with self.subTest(url=url), self.assertRaises(frappe.ValidationError) as raised:
+				settings.validate_gitlab()
+			self.assertEqual(
+				str(raised.exception),
+				"GitLab URL cannot change while GitLab App Sources exist. Archive or disable them first.",
+			)
+
+		settings.gitlab_url = GITLAB_URL + "."
+		settings.validate_gitlab_url_is_kept()
