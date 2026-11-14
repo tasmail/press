@@ -178,12 +178,19 @@ class TestGitLabPolling(FrappeTestCase):
 	def test_the_scheduled_poll_dispatches_gitlab_sources_to_the_gitlab_api(self):
 		from press.press.doctype.app.app import poll_new_releases
 
-		def answer(url, **kwargs):
-			if url.startswith(GITLAB_URL):
-				return fake_response(body=BRANCH_ANSWER)
-			raise requests.ConnectionError("no network in tests")
+		get_all = frappe.get_all
 
-		with patch("press.utils.gitlab.requests.get", side_effect=answer):
+		def only_this_source(doctype, *args, **kwargs):
+			if doctype == "App Source":
+				return [frappe._dict(name=self.source.name)]
+			return get_all(doctype, *args, **kwargs)
+
+		# The scheduled poll commits per source, which would keep the fixtures of this test
+		with (
+			patch("press.press.doctype.app.app.frappe.get_all", side_effect=only_this_source),
+			patch.object(frappe.db, "commit"),
+			patch("press.utils.gitlab.requests.get", return_value=fake_response(body=BRANCH_ANSWER)),
+		):
 			poll_new_releases()
 
 		self.assertTrue(frappe.db.exists("App Release", {"source": self.source.name, "hash": COMMIT_HASH}))
