@@ -12,6 +12,7 @@ from twilio.rest import Client
 from press.api.billing import get_stripe
 from press.press.doctype.telegram_message.telegram_message import TelegramMessage
 from press.telegram_utils import Telegram
+from press.utils import gitlab
 
 
 class PressSettings(Document):
@@ -25,6 +26,7 @@ class PressSettings(Document):
 
 		from press.press.doctype.app_group.app_group import AppGroup
 		from press.press.doctype.erpnext_app.erpnext_app import ERPNextApp
+		from press.press.doctype.gitlab_project_token.gitlab_project_token import GitLabProjectToken
 
 		agent_github_access_token: DF.Data | None
 		agent_repository_owner: DF.Data | None
@@ -171,6 +173,8 @@ class PressSettings(Document):
 		github_app_public_link: DF.Data | None
 		github_pat_token: DF.Data | None
 		github_webhook_secret: DF.Data | None
+		gitlab_project_tokens: DF.Table[GitLabProjectToken]
+		gitlab_url: DF.Data | None
 		gst_percentage: DF.Float
 		hetzner_server_limit: DF.Int
 		hetzner_vcpu_limit: DF.Int
@@ -298,6 +302,24 @@ class PressSettings(Document):
 
 		if self.minimum_rebuild_memory < 2:
 			frappe.throw("Please set the minimum rebuild memory to 2 GB or more.")
+
+		self.validate_gitlab()
+
+	def validate_gitlab(self):
+		if self.gitlab_url:
+			gitlab.validate_base_url(self.gitlab_url)
+		self.validate_gitlab_url_is_kept()
+		gitlab.validate_token_rows(self.gitlab_project_tokens)
+
+	def validate_gitlab_url_is_kept(self):
+		old_url = frappe.db.get_single_value("Press Settings", "gitlab_url")
+		if not old_url or gitlab.normalized_host(old_url) == gitlab.normalized_host(self.gitlab_url or ""):
+			return
+		if frappe.db.exists("App Source", {"provider": "GitLab"}):
+			frappe.throw(
+				"GitLab URL cannot change while GitLab App Sources exist. Archive or disable them first.",
+				frappe.ValidationError,
+			)
 
 	@frappe.whitelist()
 	def create_stripe_webhook(self):

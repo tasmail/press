@@ -147,7 +147,8 @@ def _app_clone_info(
 	commit_hash: str,
 ) -> dict:
 	source = frappe.get_doc("App Source", source_name)
-	is_private = bool(source.github_installation_id)
+	is_gitlab = source.provider == "GitLab"
+	is_private = bool(source.github_installation_id) or is_gitlab
 
 	clone_url = None
 	error = None
@@ -166,9 +167,10 @@ def _app_clone_info(
 		"repository": source.repository,
 		"branch": source.branch,
 		"hash": commit_hash,
+		"provider": source.provider,
 		"private": is_private,
 		"clone_url": clone_url,
-		"clone_url_expires_in_minutes": 60 if is_private else None,
+		"clone_url_expires_in_minutes": 60 if source.github_installation_id else None,
 		"sensitive_fields": ["clone_url"],
 		"local_dir": "cloned_repos/{}_{}".format(app.replace("/", "_"), release_name.replace("/", "_")),
 	}

@@ -173,6 +173,9 @@
 		"column_break_tcmy",
 		"column_break_edst",
 		"github_app_private_key",
+		"gitlab_section",
+		"gitlab_url",
+		"gitlab_project_tokens",
 		"aws_section",
 		"aws_access_key_id",
 		"column_break_agig",
@@ -929,6 +932,24 @@
 			"hidden": 1,
 			"label": "GitHub App Private Key",
 			"read_only": 1
+		},
+		{
+			"fieldname": "gitlab_section",
+			"fieldtype": "Section Break",
+			"label": "GitLab"
+		},
+		{
+			"description": "Scheme and host of the one self-hosted GitLab that App Sources may use, for example https://git.example.com",
+			"fieldname": "gitlab_url",
+			"fieldtype": "Data",
+			"label": "GitLab URL"
+		},
+		{
+			"description": "One read-only token per project. A token is sent only for its own project.",
+			"fieldname": "gitlab_project_tokens",
+			"fieldtype": "Table",
+			"label": "GitLab Project Tokens",
+			"options": "GitLab Project Token"
 		},
 		{
 			"fieldname": "marketplace_tab",
@@ -1903,7 +1924,7 @@
 	],
 	"issingle": 1,
 	"links": [],
-	"modified": "2026-09-11 13:26:41.047658",
+	"modified": "2026-11-14 10:00:00.000000",
 	"modified_by": "Administrator",
 	"module": "Press",
 	"name": "Press Settings",

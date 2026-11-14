@@ -46,7 +46,7 @@ from press.press.doctype.deploy_candidate.utils import (
 	get_intel_build_server_with_least_active_builds,
 	is_suspended,
 )
-from press.utils import get_current_team, log_error
+from press.utils import get_current_team, gitlab, log_error
 from press.utils.environment_variable import validate_environment_variable
 from press.utils.webhook import create_webhook_event
 
@@ -1073,6 +1073,7 @@ class DeployCandidateBuild(Document):
 		return frappe.db.get_value("Deploy Candidate Build", build_name, "docker_image")
 
 	def _get_patch_app_updates(self, previous_candidate: DeployCandidate) -> list:
+		gitlab.refuse_gitlab_sources([app.source for app in self.candidate.apps], "A patch build")
 		apps = []
 		previous_releases = {app.app: app.release for app in previous_candidate.apps}
 		for app in self.candidate.apps:
